@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural-distill"
+version = "0.1.0"
+description = "Activation Subspace Distillation (ASD) — a novel knowledge distillation method"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "omegaconf>=2.3",
+    "matplotlib>=3.7",
+    "tqdm",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-timeout"]
+
+[tool.setuptools.packages.find]
+include = ["asd*"]

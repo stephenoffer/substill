@@ -1,0 +1,35 @@
+teacher:
+  model: resnet50
+  pretrained: true
+  cifar_stem: true         # Replace 7x7 stride-2 with 3x3 stride-1 for 32x32 inputs
+  finetune_epochs: 20      # Fine-tune teacher on CIFAR-10 after stem replacement
+  finetune_lr: 0.01
+  weights_path: outputs/teacher_finetuned.pt  # Path to fine-tuned weights
+
+profiling:
+  num_calibration_samples: 5000
+  variance_threshold: 0.95
+  histogram_bins: 64
+
+student:
+  blocks_per_stage: 2
+  min_width: 16
+  width_multiple: 8
+
+training:
+  epochs: 200
+  batch_size: 128
+  lr: 0.1
+  weight_decay: 5.0e-4
+  momentum: 0.9
+  lr_schedule: cosine
+  loss_alpha: 1.0     # task loss weight
+  loss_beta: 0.5      # subspace matching weight
+  loss_gamma: 0.3     # sparsity pattern weight
+  gamma_warmup_epochs: 10
+
+data:
+  dataset: cifar10
+  data_dir: ./data
+  num_workers: 4
+  augmentation: standard
