@@ -87,12 +87,19 @@ def main():
     layer_names = get_resnet50_layer_names()
     print(f"  Hooking {len(layer_names)} layers: {layer_names}")
 
-    engine = ActivationCaptureEngine(teacher.backbone, layer_names)
+    cov_mode = cfg.profiling.get("covariance_mode", "per_pixel")
+    print(f"  Covariance mode: {cov_mode}")
+    engine = ActivationCaptureEngine(
+        teacher.backbone, layer_names, covariance_mode=cov_mode,
+    )
     accumulators = engine.run(calib_loader, device=device)
 
     # Analyze each layer
     print("\nAnalyzing activation profiles...")
-    svd_analyzer = SVDAnalyzer(variance_threshold=cfg.profiling.variance_threshold)
+    svd_analyzer = SVDAnalyzer(
+        variance_threshold=cfg.profiling.variance_threshold,
+        definition=cfg.profiling.get("rank_definition", "variance"),
+    )
     sparsity_analyzer = SparsityAnalyzer(num_bins=cfg.profiling.histogram_bins)
 
     profiles = []

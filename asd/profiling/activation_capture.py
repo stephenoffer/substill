@@ -12,22 +12,59 @@ from tqdm import tqdm
 class CovarianceAccumulator:
     """Accumulates channel-wise covariance in O(C^2) memory.
 
-    Instead of storing all activation tensors (GBs), we maintain a running
-    sum-of-outer-products and mean, then finalize to a covariance matrix.
+    Two aggregation modes determine how spatial activations are reduced before
+    the outer product:
+
+    - mode="per_pixel" (default): treat each spatial position as a sample in
+      the C-dim channel space. Adjacent pixels share large receptive fields
+      and are NOT i.i.d., so the raw (B·H·W) sample count overstates the
+      effective sample size and biases the top eigenvalues upward. We
+      optionally sub-sample spatial positions to mitigate this —
+      `spatial_subsample` keeps every k-th pixel per image (default: all).
+
+    - mode="gap": average over (H, W) first, then accumulate outer products.
+      Legacy behavior — measures covariance of spatial means, not of the
+      channel distribution at a pixel.
+
+    Accumulation device defaults to the input activation's device (GPU when
+    possible) — the previous CPU-only behavior forced a CUDA→CPU copy per
+    batch and was a substantial profiling-speed regressor. Pass
+    `device="cpu"` to force CPU if GPU memory is tight.
     """
 
-    def __init__(self, num_channels: int, device: str = "cpu"):
+    def __init__(
+        self,
+        num_channels: int,
+        device: str | None = None,
+        mode: str = "per_pixel",
+        spatial_subsample: int = 1,
+    ):
+        if mode not in ("per_pixel", "gap"):
+            raise ValueError(f"mode must be 'per_pixel' or 'gap', got {mode!r}")
+        if spatial_subsample < 1:
+            raise ValueError(f"spatial_subsample must be ≥ 1, got {spatial_subsample}")
         self.num_channels = num_channels
+        # None → match the activation's device on first update.
         self.device = device
+        self.mode = mode
+        self.spatial_subsample = spatial_subsample
         self.n = 0
-        self.sum_x = torch.zeros(num_channels, device=device, dtype=torch.float64)
-        self.sum_xx = torch.zeros(num_channels, num_channels, device=device, dtype=torch.float64)
+        self.sum_x: Tensor | None = None
+        self.sum_xx: Tensor | None = None
         # Running histogram for sparsity analysis
         self.num_zeros = 0
         self.num_total = 0
         self.activation_values: list[Tensor] = []  # small buffer for histogram
         self._hist_budget = 100_000  # max values to store for histogram
         self._hist_stored = 0  # track actual number of stored values
+
+    def _ensure_buffers(self, act: Tensor) -> None:
+        if self.sum_x is not None:
+            return
+        dev = self.device if self.device is not None else act.device
+        self.device = dev
+        self.sum_x = torch.zeros(self.num_channels, device=dev, dtype=torch.float64)
+        self.sum_xx = torch.zeros(self.num_channels, self.num_channels, device=dev, dtype=torch.float64)
 
     def update(self, activation: Tensor) -> None:
         """Update with a batch of activations, shape (B, C, H, W) or (B, C)."""
@@ -46,10 +83,20 @@ class CovarianceAccumulator:
             self.activation_values.append(sample)
             self._hist_stored += len(sample)
 
-        # Global average pool if spatial dims present
+        # Reduce spatial dims based on mode
         if act.dim() == 4:
-            act = act.mean(dim=(2, 3))  # (B, C)
+            if self.mode == "gap":
+                act = act.mean(dim=(2, 3))  # (B, C)
+            else:  # per_pixel
+                if self.spatial_subsample > 1:
+                    # Stride spatial dims. Halves correlation between adjacent
+                    # samples without losing coverage — better-conditioned
+                    # covariance estimate at the same compute budget.
+                    act = act[:, :, :: self.spatial_subsample, :: self.spatial_subsample]
+                # (B, C, H', W') → (B*H'*W', C)
+                act = act.permute(0, 2, 3, 1).reshape(-1, act.shape[1])
 
+        self._ensure_buffers(act)
         act = act.to(dtype=torch.float64, device=self.device)
         batch_size = act.shape[0]
 
@@ -59,13 +106,21 @@ class CovarianceAccumulator:
 
     def finalize(self) -> Tensor:
         """Return (C, C) covariance matrix."""
+        if self.sum_x is None or self.n == 0:
+            return torch.zeros(self.num_channels, self.num_channels)
         mean = self.sum_x / self.n
         cov = self.sum_xx / self.n - mean.unsqueeze(1) * mean.unsqueeze(0)
-        return cov.float()
+        # Symmetrize — float64 accumulation can still drift by a few ULPs and
+        # downstream torch.linalg.eigh complains on sufficiently non-Hermitian
+        # matrices.
+        cov = 0.5 * (cov + cov.T)
+        return cov.float().cpu()
 
     @property
     def mean(self) -> Tensor:
-        return (self.sum_x / self.n).float()
+        if self.sum_x is None or self.n == 0:
+            return torch.zeros(self.num_channels)
+        return (self.sum_x / self.n).float().cpu()
 
     @property
     def sparsity_ratio(self) -> float:
@@ -83,10 +138,20 @@ class CovarianceAccumulator:
 class ActivationCaptureEngine:
     """Registers forward hooks on specified layers to accumulate covariance matrices."""
 
-    def __init__(self, model: nn.Module, layer_names: list[str]):
+    def __init__(
+        self,
+        model: nn.Module,
+        layer_names: list[str],
+        covariance_mode: str = "per_pixel",
+        spatial_subsample: int = 1,
+        accumulator_device: str | None = None,
+    ):
         self.model = model
         self.layer_names = layer_names
-        self._hooks: list[torch.utils.hooks.RemovableHook] = []
+        self.covariance_mode = covariance_mode
+        self.spatial_subsample = spatial_subsample
+        self.accumulator_device = accumulator_device
+        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._accumulators: dict[str, CovarianceAccumulator] = {}
         self._initialized: set[str] = set()
 
@@ -105,13 +170,16 @@ class ActivationCaptureEngine:
         def hook_fn(module, input, output):
             act = output
             if name not in self._initialized:
-                # Lazily create accumulator with correct channel count
-                # Covariance is always accumulated on CPU to save GPU memory
                 if act.dim() == 4:
                     num_channels = act.shape[1]
                 else:
                     num_channels = act.shape[-1]
-                self._accumulators[name] = CovarianceAccumulator(num_channels, device="cpu")
+                self._accumulators[name] = CovarianceAccumulator(
+                    num_channels,
+                    device=self.accumulator_device,
+                    mode=self.covariance_mode,
+                    spatial_subsample=self.spatial_subsample,
+                )
                 self._initialized.add(name)
             self._accumulators[name].update(act)
         return hook_fn
@@ -142,29 +210,37 @@ class ActivationCaptureEngine:
         self._hooks.clear()
 
 
-def get_resnet50_layer_names() -> list[str]:
-    """Return the layer names to hook for ResNet50 (output of each residual block)."""
-    names = []
-    # layer1: 3 Bottleneck blocks
-    for i in range(3):
-        names.append(f"layer1.{i}")
-    # layer2: 4 Bottleneck blocks
-    for i in range(4):
-        names.append(f"layer2.{i}")
-    # layer3: 6 Bottleneck blocks
-    for i in range(6):
-        names.append(f"layer3.{i}")
-    # layer4: 3 Bottleneck blocks
-    for i in range(3):
-        names.append(f"layer4.{i}")
+_RESNET_BLOCK_COUNTS = {
+    "resnet50": [3, 4, 6, 3],
+    "resnet18": [2, 2, 2, 2],
+    "resnet34": [3, 4, 6, 3],
+    "resnet101": [3, 4, 23, 3],
+}
+
+
+def get_resnet_layer_names(backbone: str = "resnet50") -> list[str]:
+    """Return the layer names to hook for a ResNet variant (output of each residual block)."""
+    counts = _RESNET_BLOCK_COUNTS[backbone]
+    names: list[str] = []
+    for stage_idx, n_blocks in enumerate(counts, start=1):
+        for i in range(n_blocks):
+            names.append(f"layer{stage_idx}.{i}")
     return names
 
 
-def get_resnet50_stage_layer_names() -> dict[str, list[str]]:
+def get_resnet_stage_layer_names(backbone: str = "resnet50") -> dict[str, list[str]]:
     """Return layer names grouped by stage."""
+    counts = _RESNET_BLOCK_COUNTS[backbone]
     return {
-        "stage1": [f"layer1.{i}" for i in range(3)],
-        "stage2": [f"layer2.{i}" for i in range(4)],
-        "stage3": [f"layer3.{i}" for i in range(6)],
-        "stage4": [f"layer4.{i}" for i in range(3)],
+        f"stage{stage_idx}": [f"layer{stage_idx}.{i}" for i in range(n_blocks)]
+        for stage_idx, n_blocks in enumerate(counts, start=1)
     }
+
+
+# Back-compat aliases (keep old call sites working)
+def get_resnet50_layer_names() -> list[str]:
+    return get_resnet_layer_names("resnet50")
+
+
+def get_resnet50_stage_layer_names() -> dict[str, list[str]]:
+    return get_resnet_stage_layer_names("resnet50")

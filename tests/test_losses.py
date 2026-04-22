@@ -63,29 +63,65 @@ def test_subspace_loss_gradient_flow():
         assert sp.grad.abs().sum() > 0, f"Zero gradient for stage {i}"
 
 
-def test_subspace_loss_zero_when_matched():
-    """Loss should be near zero when student perfectly matches teacher subspace."""
+def test_subspace_loss_zero_when_matched_gap():
+    """In GAP mode, loss is near zero when student == GAP-projected teacher."""
     profiles = _make_profiles()
-    loss_fn = SubspaceMatchingLoss(profiles, sv_weighted=False)
+    loss_fn = SubspaceMatchingLoss(profiles, sv_weighted=False, mode="gap")
 
     teacher_features = []
     student_projected = []
     for i, p in enumerate(profiles):
         spatial = 32 // (2**i)
-        # Create teacher features
         t_feat = torch.randn(4, p.total_channels, spatial, spatial)
         teacher_features.append(t_feat)
 
-        # Create student features that match teacher's subspace projection
-        t_pooled = t_feat.mean(dim=(2, 3))  # (B, C)
-        components = p.principal_components  # (C, k)
-        t_subspace = t_pooled @ components  # (B, k)
-        # Reshape to (B, k, 1, 1) and expand to spatial dims
+        t_pooled = t_feat.mean(dim=(2, 3))
+        t_subspace = t_pooled @ p.principal_components
         s_feat = t_subspace.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, spatial, spatial)
         student_projected.append(s_feat)
 
     loss = loss_fn(student_projected, teacher_features)
     assert loss.item() < 0.01, f"Expected near-zero loss, got {loss.item():.4f}"
+
+
+def test_subspace_loss_zero_when_matched_spatial():
+    """In spatial mode, loss is near zero when student == per-pixel-projected teacher."""
+    profiles = _make_profiles()
+    loss_fn = SubspaceMatchingLoss(profiles, sv_weighted=False, mode="spatial")
+
+    teacher_features = []
+    student_projected = []
+    for i, p in enumerate(profiles):
+        spatial = 32 // (2**i)
+        t_feat = torch.randn(4, p.total_channels, spatial, spatial)
+        teacher_features.append(t_feat)
+
+        # Per-pixel projection: (C, k) applied at each (h, w)
+        s_feat = torch.einsum("bchw,ck->bkhw", t_feat, p.principal_components)
+        student_projected.append(s_feat)
+
+    loss = loss_fn(student_projected, teacher_features)
+    assert loss.item() < 1e-4, f"Expected near-zero loss, got {loss.item():.6f}"
+
+
+def test_subspace_loss_modes_differ():
+    """Spatial and GAP modes should give different losses on random features."""
+    profiles = _make_profiles()
+    student_projected = [
+        torch.randn(4, p.effective_rank, 32 // (2**i), 32 // (2**i))
+        for i, p in enumerate(profiles)
+    ]
+    teacher_features = [
+        torch.randn(4, p.total_channels, 32 // (2**i), 32 // (2**i))
+        for i, p in enumerate(profiles)
+    ]
+
+    l_spatial = SubspaceMatchingLoss(profiles, mode="spatial")(student_projected, teacher_features)
+    l_gap = SubspaceMatchingLoss(profiles, mode="gap")(student_projected, teacher_features)
+    assert l_spatial.item() > 0
+    assert l_gap.item() > 0
+    # They're computed on different reductions → shouldn't coincide
+    assert abs(l_spatial.item() - l_gap.item()) > 1e-3
 
 
 def test_sparsity_loss_gradient_flow():

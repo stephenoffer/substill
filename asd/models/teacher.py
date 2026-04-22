@@ -14,16 +14,58 @@ from torch import Tensor
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import (
+    resnet18, ResNet18_Weights,
+    resnet34, ResNet34_Weights,
+    resnet50, ResNet50_Weights,
+    resnet101, ResNet101_Weights,
+)
 
 from ..profiling.svd_analysis import LayerProfile
 
 
-class TeacherWrapper(nn.Module):
-    """ResNet50 teacher that exposes per-stage features and SVD projection."""
+_BACKBONES = {
+    "resnet50": {
+        "ctor": resnet50,
+        "weights": ResNet50_Weights.DEFAULT,
+        "stage_channels": [256, 512, 1024, 2048],
+        "block_counts": [3, 4, 6, 3],
+        "block_type": "bottleneck",
+        "fc_in": 2048,
+    },
+    "resnet18": {
+        "ctor": resnet18,
+        "weights": ResNet18_Weights.DEFAULT,
+        "stage_channels": [64, 128, 256, 512],
+        "block_counts": [2, 2, 2, 2],
+        "block_type": "basic",
+        "fc_in": 512,
+    },
+    "resnet34": {
+        "ctor": resnet34,
+        "weights": ResNet34_Weights.DEFAULT,
+        "stage_channels": [64, 128, 256, 512],
+        "block_counts": [3, 4, 6, 3],
+        "block_type": "basic",
+        "fc_in": 512,
+    },
+    "resnet101": {
+        "ctor": resnet101,
+        "weights": ResNet101_Weights.DEFAULT,
+        "stage_channels": [256, 512, 1024, 2048],
+        "block_counts": [3, 4, 23, 3],
+        "block_type": "bottleneck",
+        "fc_in": 2048,
+    },
+}
 
-    # Channel counts at each stage output for ResNet50
-    STAGE_CHANNELS = [256, 512, 1024, 2048]
+
+class TeacherWrapper(nn.Module):
+    """ResNet teacher (resnet50 / resnet18) exposing per-stage features + SVD projection."""
+
+    # Kept as a class-level default so legacy callers that reference
+    # TeacherWrapper.STAGE_CHANNELS still work when the teacher is ResNet50.
+    STAGE_CHANNELS = _BACKBONES["resnet50"]["stage_channels"]
 
     def __init__(
         self,
@@ -32,21 +74,34 @@ class TeacherWrapper(nn.Module):
         pretrained: bool = True,
         num_classes: int = 10,
         freeze: bool = True,
+        model: str = "resnet50",
     ):
         super().__init__()
+        if model not in _BACKBONES:
+            raise ValueError(f"Unknown backbone: {model!r}. Available: {list(_BACKBONES)}")
 
-        # Load pretrained ResNet50
-        weights = ResNet50_Weights.DEFAULT if pretrained else None
-        backbone = resnet50(weights=weights)
+        spec = _BACKBONES[model]
+        self.model_name = model
+        self.stage_channels = list(spec["stage_channels"])
+        self.block_counts = list(spec["block_counts"])
+        self.teacher_block_type = spec["block_type"]
+
+        weights = spec["weights"] if pretrained else None
+        backbone = spec["ctor"](weights=weights)
 
         if cifar_stem:
             # Replace 7x7 stride-2 conv + maxpool with 3x3 stride-1 conv for 32x32 inputs.
             # NOTE: This layer is randomly initialized and requires fine-tuning.
-            backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            first_out = spec["stage_channels"][0] if model == "resnet18" else 64
+            backbone.conv1 = nn.Conv2d(3, first_out, kernel_size=3, stride=1, padding=1, bias=False)
             backbone.maxpool = nn.Identity()
 
-        # Replace classifier head (randomly initialized — requires fine-tuning)
-        backbone.fc = nn.Linear(2048, num_classes)
+        # Replace classifier head only when the number of classes differs from
+        # the pretrained model's output — otherwise (e.g., ImageNet with
+        # num_classes=1000) we preserve the trained fc so the teacher is
+        # usable out of the box without fine-tuning.
+        if num_classes != 1000:
+            backbone.fc = nn.Linear(spec["fc_in"], num_classes)
 
         self.backbone = backbone
         self._is_frozen = False

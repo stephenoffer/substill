@@ -33,11 +33,58 @@ class BasicBlock(nn.Module):
         return out
 
 
+class Bottleneck(nn.Module):
+    """ResNet Bottleneck block (1x1 → 3x3 → 1x1 + skip).
+
+    Internal (hidden) width is out_channels // expansion, making the block
+    ~17x cheaper in parameters than a BasicBlock at the same output width.
+    This is what makes per-stage width equal to teacher's effective rank
+    actually translate into fewer parameters than the teacher.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        expansion: int = 4,
+        min_hidden: int = 8,
+    ):
+        super().__init__()
+        hidden = max(min_hidden, out_channels // expansion)
+
+        self.conv1 = nn.Conv2d(in_channels, hidden, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(hidden)
+        self.conv2 = nn.Conv2d(hidden, hidden, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(hidden)
+        self.conv3 = nn.Conv2d(hidden, out_channels, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
+_BLOCK_TYPES = {"basic": BasicBlock, "bottleneck": Bottleneck}
+
+
 class SlimNet(nn.Module):
     """Compact student network with per-stage channel widths from activation rank analysis.
 
-    Architecture mirrors ResNet's 4-stage structure but uses:
-    - BasicBlocks (not Bottleneck) for simplicity
+    Architecture mirrors ResNet's 4-stage structure:
+    - Bottleneck blocks by default (matches ResNet50's block type and expansion=4)
     - Per-stage widths set to teacher's effective activation rank
     - CIFAR-10 stem (3x3 stride 1, no maxpool)
     """
@@ -47,18 +94,39 @@ class SlimNet(nn.Module):
         stage_widths: list[int],
         blocks_per_stage: int = 2,
         num_classes: int = 10,
+        block_type: str = "bottleneck",
+        stem_type: str = "cifar",
     ):
         super().__init__()
         assert len(stage_widths) == 4, "Need exactly 4 stage widths"
+        if block_type not in _BLOCK_TYPES:
+            raise ValueError(
+                f"Unknown block_type {block_type!r}; expected one of {list(_BLOCK_TYPES)}"
+            )
+        if stem_type not in ("cifar", "imagenet"):
+            raise ValueError(f"stem_type must be 'cifar' or 'imagenet', got {stem_type!r}")
 
         self.stage_widths = stage_widths
+        self.blocks_per_stage = blocks_per_stage
+        self.block_type = block_type
+        self.stem_type = stem_type
+        self._block_cls = _BLOCK_TYPES[block_type]
 
-        # CIFAR-10 stem: 3x3 conv stride 1
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, stage_widths[0], kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(stage_widths[0]),
-            nn.ReLU(inplace=True),
-        )
+        if stem_type == "cifar":
+            # CIFAR-10 stem: 3x3 conv stride 1, no pool
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, stage_widths[0], kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(stage_widths[0]),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            # ImageNet stem: 7x7 stride-2 conv + maxpool (matches torchvision ResNet)
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, stage_widths[0], kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(stage_widths[0]),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            )
 
         # Build 4 stages
         self.stage1 = self._make_stage(stage_widths[0], stage_widths[0], blocks_per_stage, stride=1)
@@ -74,9 +142,9 @@ class SlimNet(nn.Module):
     def _make_stage(
         self, in_channels: int, out_channels: int, num_blocks: int, stride: int,
     ) -> nn.Sequential:
-        blocks = [BasicBlock(in_channels, out_channels, stride=stride)]
+        blocks = [self._block_cls(in_channels, out_channels, stride=stride)]
         for _ in range(1, num_blocks):
-            blocks.append(BasicBlock(out_channels, out_channels, stride=1))
+            blocks.append(self._block_cls(out_channels, out_channels, stride=1))
         return nn.Sequential(*blocks)
 
     def _init_weights(self) -> None:
@@ -123,5 +191,6 @@ class SlimNet(nn.Module):
         params = self.count_parameters()
         return (
             f"SlimNet(stage_widths={self.stage_widths}, "
+            f"block_type={self.block_type}, "
             f"params={params:,} ({params / 1e6:.2f}M))"
         )

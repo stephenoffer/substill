@@ -28,9 +28,9 @@ def test_covariance_accumulator_symmetry():
     assert torch.allclose(cov, cov.T, atol=1e-5)
 
 
-def test_covariance_trace_matches_variance():
-    """Trace of covariance should equal sum of channel variances (approximately)."""
-    acc = CovarianceAccumulator(num_channels=16)
+def test_covariance_trace_matches_variance_gap():
+    """In GAP mode, trace should equal sum of per-channel variance of GAP features."""
+    acc = CovarianceAccumulator(num_channels=16, mode="gap")
     all_pooled = []
     for _ in range(50):
         batch = torch.randn(32, 16, 4, 4)
@@ -40,6 +40,23 @@ def test_covariance_trace_matches_variance():
     cov = acc.finalize()
     all_pooled = torch.cat(all_pooled)
     expected_var = all_pooled.var(dim=0, correction=0).sum()
+    trace = cov.diagonal().sum()
+    assert abs(trace.item() - expected_var.item()) < 0.1, \
+        f"Trace {trace.item():.4f} != expected variance {expected_var.item():.4f}"
+
+
+def test_covariance_trace_matches_variance_per_pixel():
+    """In per-pixel mode, trace should equal sum of per-channel variance of all pixels."""
+    acc = CovarianceAccumulator(num_channels=16, mode="per_pixel")
+    all_pixels = []
+    for _ in range(50):
+        batch = torch.randn(32, 16, 4, 4)
+        acc.update(batch)
+        all_pixels.append(batch.permute(0, 2, 3, 1).reshape(-1, 16))
+
+    cov = acc.finalize()
+    all_pixels = torch.cat(all_pixels)
+    expected_var = all_pixels.var(dim=0, correction=0).sum()
     trace = cov.diagonal().sum()
     assert abs(trace.item() - expected_var.item()) < 0.1, \
         f"Trace {trace.item():.4f} != expected variance {expected_var.item():.4f}"

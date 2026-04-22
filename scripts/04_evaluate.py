@@ -88,15 +88,33 @@ def main():
     ckpt = torch.load(args.checkpoint, weights_only=False, map_location=device)
     stage_widths = ckpt["stage_widths"]
 
-    # Build and load student
-    student = SlimNet(stage_widths=stage_widths, blocks_per_stage=cfg.student.blocks_per_stage)
+    # Build and load student — use architecture stored in the checkpoint so the
+    # evaluator can never accidentally rebuild with a different block type/depth
+    # than was used to train.
+    blocks_per_stage = ckpt.get("blocks_per_stage", cfg.student.blocks_per_stage)
+    block_type = ckpt.get("block_type", cfg.student.get("block_type", "bottleneck"))
+    student = SlimNet(
+        stage_widths=stage_widths,
+        blocks_per_stage=blocks_per_stage,
+        block_type=block_type,
+    )
     student.load_state_dict(ckpt["student_state_dict"])
 
-    # Build teacher
+    # Build teacher with fine-tuned weights (pretrained ImageNet weights alone
+    # give ~10% accuracy because the CIFAR stem and classifier are random).
     teacher = TeacherWrapper(
         cifar_stem=cfg.teacher.cifar_stem,
-        pretrained=cfg.teacher.pretrained,
+        pretrained=False,
+        freeze=True,
     )
+    weights_path = cfg.teacher.weights_path
+    if os.path.exists(weights_path):
+        print(f"Loading fine-tuned teacher weights from {weights_path}")
+        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+        teacher.backbone.load_state_dict(state_dict)
+    else:
+        print(f"WARNING: fine-tuned teacher weights not found at {weights_path}. "
+              "Teacher accuracy will be ~10% (random classifier).")
 
     # Evaluate both
     print("\nEvaluating teacher (ResNet50)...")
