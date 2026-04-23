@@ -39,7 +39,6 @@ _STATS = {
     },
 }
 
-# Legacy constants kept for back-compat
 CIFAR10_MEAN = _STATS["cifar10"]["mean"]
 CIFAR10_STD = _STATS["cifar10"]["std"]
 

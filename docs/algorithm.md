@@ -1,204 +1,152 @@
-# ASD Algorithm
+# How ASD works
 
-Detailed reference for the Activation Subspace Distillation pipeline.
-Covers all three phases and the mathematical form of every loss component.
-For *why* individual components do or don't work empirically, see
-[findings.md](findings.md).
+This doc explains the mechanism. For usage, see
+[../README.md](../README.md) and [quickstart.md](quickstart.md).
 
-## Pipeline at a glance
+## The setup
 
-```
-Phase 0: Fine-tune teacher on the target dataset
-         → outputs/teacher_finetuned.pt
-Phase 1: Capture per-block activation covariance
-         → eigendecompose → per-layer effective rank + principal components
-Phase 2: Build SlimNet student with per-stage widths equal to effective rank
-         (rounded to multiple of 8, floored at min_width=16)
-Phase 3: Train student with combined loss
-         L = α·L_task + β(t)·L_sub + γ(t)·L_spar + δ·L_kd + ε·L_rkd + ζ·L_at
-```
+Given a large teacher `T` and a task dataset, we want a smaller student
+`S` that behaves like `T`. ASD drives the student to match the teacher
+inside a low-rank subspace of the teacher's activations, layer by
+layer.
 
-Entry points in `scripts/`:
+## Three phases
 
-| script | role |
-|---|---|
-| `00_finetune_teacher.py` | Phase 0 |
-| `01_profile_teacher.py` | Phase 1 — saves profiles to disk |
-| `02_build_student.py` | Phase 2 — reports student architecture |
-| `03_train_asd.py` | Phase 3 — single-config training |
-| `07_bench.py` | 0→3 end-to-end for a (model, dataset) pair |
-| `08_ablation.py` | 3 only — ablates one component at a time on cached teacher |
-| `09_llm_distill.py` | Self-contained 0→3 for GPT-2/WikiText-2 |
+### 1. Profile
 
-## Phase 1 — activation profiling
+For each layer you care about, hook the teacher's forward pass and
+accumulate the channel covariance `C_l = E[x_l x_l^T]` over a
+calibration set. What "the layer's activation" means depends on
+`source`:
 
-Forward hooks on every residual block accumulate channel-wise covariance in
-O(C²) memory:
+- `source="output"` — the layer's forward output.
+- `source="delta"` — the residual update `Δx_l = output − shortcut(input)`,
+  which strips the identity path on residual architectures. On ResNets,
+  the identity typically dominates the output covariance and hides the
+  block's actual contribution; delta makes that contribution
+  observable.
+- `source="branch"` — a sub-module's output (attention or MLP inside a
+  transformer block). Like delta, this isolates a specific computation
+  from the residual stream.
 
-```
-Cov(layer) = E[x · xᵀ] − E[x] · E[x]ᵀ
-```
+Eigendecompose each `C_l = V_l Λ_l V_l^T` in descending eigenvalue
+order. Pick a retained rank `k_l` using one of:
 
-`x` is the channel vector at each spatial position
-([activation_capture.py](../asd/profiling/activation_capture.py#L35-L67)).
-Two covariance modes:
+- **Variance threshold**: smallest `k` with `sum(λ_1..λ_k) / sum(λ) ≥
+  τ` (default τ=0.95).
+- **Marchenko-Pastur / Gavish-Donoho bulk edge** (`noise_model="mp"`):
+  for an i.i.d. Gaussian covariance with aspect ratio `β = C/N_eff`
+  the noise eigenvalues form a bulk whose upper edge sits at
+  `ω(β)² · σ²`. Eigenvalues above that threshold are signal; below
+  are noise. In practice this gives a much tighter rank estimate than
+  variance+ε on spectra with a long noise tail.
+- Optional Ledoit-Wolf shrinkage applied to `C_l` before
+  eigendecomposition for small-N calibration sets.
 
-- **`per_pixel` (default)** — treat each (H×W) position as an independent
-  sample in C-dim channel space. Optionally sub-sample spatial positions
-  (`spatial_subsample=k`) to mitigate adjacent-pixel correlation inflating
-  top eigenvalues. Dense signal, better rank estimate.
-- **`gap`** — globally pool to (B, C) first, then accumulate. Legacy
-  behavior; much weaker rank estimate because it measures the covariance
-  of spatial means, not the channel distribution per-pixel.
+The profile `{V_l, Λ_l, k_l}` for each layer is the subspace
+snapshot. It's pickle-safe.
 
-Covariance is symmetrized defensively before `torch.linalg.eigh`. Any
-negative eigenvalue larger than `1e-4 · λ_max` raises — a hard failure
-instead of silent `clamp(min=0)` masking.
+### 2. Loss
 
-### Effective rank — four definitions
+At training time, hook the teacher and student at matching layers.
+For each teacher hidden `x_l^T` and student hidden `x_l^S`, project
+into the top-`k_l` subspace:
 
-From [svd_analysis.py:109-178](../asd/profiling/svd_analysis.py#L109-L178):
+    z_l^T = x_l^T V_l                  ∈ ℝ^{N × k}
+    z_l^S = proj_l(x_l^S)              ∈ ℝ^{N × k}
 
-| name | formula | best for |
-|---|---|---|
-| `variance` (default) | smallest k with `Σ_{i≤k}λ_i / Σλ_i ≥ τ` | "classical" low-rank, sensitive to tail |
-| `stable` | `⌈Σλ_i / λ_max⌉` | dimensionless, no threshold |
-| `participation` | `⌈(Σλ_i)² / Σλ_i²⌉` | robust to heavy tails, threshold-free |
-| `entropy` | `⌈exp(H(p))⌉` with `p_i = λ_i/Σλ` | between stable and variance |
+where `proj_l` is a per-layer learnable linear projection from the
+student's hidden dim to `k_l`. Then compute one of three objectives:
 
-An `eps_relative = 1e-6` noise floor zeroes eigenvalues below `eps·λ_max`
-before the rank statistic is computed, so float32 noise doesn't inflate
-participation / entropy ranks.
+- **coord_mse**: `||z^T − z^S||²`. Point-wise match in the teacher's
+  eigenbasis. Basis-sensitive — when eigenvalues are close, the basis
+  inside the retained subspace is arbitrary up to rotation, and the
+  student has to match an arbitrary basis pointlessly precisely.
 
-### Stage aggregation
+- **gram**: `||K_s − K_t||_F²` where `K = Z Zᵀ` is the token/pixel-
+  wise kernel matrix. Basis-invariant under rotations of `V_l` within
+  the retained subspace. Computed via the trace identity
+  `||K_s||² + ||K_t||² − 2||Z_sᵀ Z_t||²` so only k×k inner products
+  are materialized.
 
-Multiple blocks per stage share a channel count. `aggregate_stage_profile`
-reduces per-block profiles to one per-stage profile:
+- **cka**: `1 − <K_s, K_t>_F / (‖K_s‖·‖K_t‖)`. Centered kernel
+  alignment. Completely scale-invariant — the student can over- or
+  under-shoot the teacher's feature magnitude and CKA still drives
+  alignment. This is what makes the loss stable on LLMs where
+  residual-stream magnitudes are large.
 
-- `last` (default) — use the last block's profile. Matches stage output.
-- `max_rank` — block with the highest effective rank (information bottleneck).
-- `average` — sum per-block covariances as `Σ V_b Λ_b V_bᵀ`, re-eigendecompose.
+**Feature normalization** is L2 per-sample over the channel axis
+before forming the kernels. Without it, Gram entries scale as
+`magnitude⁴ · k²` and blow up to 10⁶ on GPT-2-class features. With
+it, entries are in `[-1, 1]` and the loss stays bounded regardless of
+residual magnitude. Default = on.
 
-## Phase 2 — student construction
+**Spectral weighting** is optional: `w_i ∝ λ_i^(-p)` for `p ∈ [-1.5,
+1.5]`. `p = 0` (uniform) is the default. `p < 0` emphasizes large-
+eigenvalue directions (the "loud" variance); `p > 0` emphasizes
+small-eigenvalue directions ("whitening" — often preferred on
+transformer spectra with heavy tails).
 
-`SlimNet` mirrors the teacher's 4-stage layout. Per-stage channel width =
-effective rank, rounded up to `width_multiple=8`, floored at `min_width=16`.
+### 3. Train
 
-Example (ResNet50 / CIFAR-10):
+Add the subspace loss to whatever training loop you already have:
 
-| τ | stage widths | student params | vs teacher (23.5M) |
-|---|---|---|---|
-| 0.70 | [24, 88, 232, 392] | 557,802 | 42.2× |
-| 0.85 | [56, 192, 464, 904] | 2,684,354 | 8.8× |
-| 0.95 | [128, 336, 744, 1504] | 7,330,818 | 3.2× |
-| 0.99 | [184, 440, 952, 1904] | 11,684,706 | 2.0× |
+    L = α·L_task + β·L_subspace + δ·L_logit_kd
 
-A `SubspaceProjectorBank` of 4 1×1 convs maps student feature maps to
-the teacher's subspace dim per stage:
-`(B, student_width_i, H, W) → (B, teacher_rank_i, H, W)`. Orthogonal init
-by default (preserves activation variance for a linear layer); no BN by
-default (the `normalize_features` option on the loss covers scale
-invariance more cleanly).
+The student and the subspace loss's learnable projectors are both
+optimized. Everything else about your training loop (optimizer,
+schedule, gradient clipping, mixed precision, …) is unchanged.
 
-## Phase 3 — combined loss
+## Why it works
 
-```
-L = α·L_task
-  + β(t)·L_subspace       (subspace-MSE)
-  + γ(t)·L_sparsity       (activation histogram match)
-  + δ·L_logit_kd          (Hinton KD)
-  + ε·L_relation          (RKD — opt-in)
-  + ζ·L_attention         (AT — opt-in)
-```
+Two intuitions stacked:
 
-Source: [combined_loss.py](../asd/losses/combined_loss.py).
+1. **Teachers don't use all their channels.** Layer covariance
+   spectra are heavy-head: the first few dozen principal directions
+   carry most of the teacher's computation. A student with channel
+   width equal to the effective rank has the *capacity* to reproduce
+   the teacher's behavior at that layer.
 
-Defaults from `config/default.yaml`: α=1.0, β=0.5, γ=0.3, δ=1.0, ε=0, ζ=0.
+2. **Subspace alignment is a cleaner supervision signal than raw
+   feature MSE.** Matching the teacher's top-`k` subspace is
+   permissive about where exactly the student puts its features
+   within that subspace; matching full-width features forces the
+   student to mimic the teacher's axis choices, many of which are
+   redundant or arbitrary.
 
-### L_task — cross-entropy
+The objective family (coord_mse → gram → cka) trades increasing
+invariance for decreasing fine-grained signal. Coord MSE is the
+tightest match but most fragile; Gram is invariant to basis rotations
+inside the retained subspace; CKA is additionally invariant to
+overall scale. Pick the loosest objective that still drives your
+student — typically gram for CNNs and cka for LLMs.
 
-Standard: `CE(student_logits, labels)`.
+## What the knobs actually control
 
-### L_subspace — the core of ASD
+| knob                  | effect                                                                  |
+|-----------------------|-------------------------------------------------------------------------|
+| `source`              | what gets profiled — raw activations, residual updates, or branches.     |
+| `noise_model`         | how retained rank `k` is chosen — fixed threshold or signal/noise MP cutoff. |
+| `shrinkage`           | regularize the covariance before eigendecomposition (small-N setups).    |
+| `objective`           | how the student matches the teacher — tightest to loosest: mse / gram / cka. |
+| `normalize_features`  | bound kernel entries; required for LLM stability.                        |
+| `power_weight_p`      | reweight components across the spectrum.                                 |
+| `arch_multiplier`     | scale the retained rank to get a bigger student (more slack for optimization). |
 
-Three modes in [subspace_loss.py](../asd/losses/subspace_loss.py):
+## Implementation modules
 
-**`spatial` (default)** — per-pixel match in the teacher's subspace:
-```
-L_sub = Σ_stages mean_BHW [Σ_k w_k · (s_feat[b,k,h,w] − (Vᵀ x_t[b,:,h,w])_k)²]
-```
-where `V` is the stage's top-k principal components matrix (C, k) and
-`s_feat` is the student's output of the subspace projector at that stage.
-`w_k` is the per-PC weight (below).
-
-**`gap`** — pool spatial dims first, then MSE in k dims. Loses spatial
-structure; only use for ablations.
-
-**`cosine_spatial`** — scale-invariant per-position cosine distance:
-`L = 1 − cos(s_feat, Vᵀ x_t)` averaged over (B, H, W). Insensitive to
-feature-magnitude mismatch between student and teacher. SV weighting is
-ignored (direction is already scale-free).
-
-### SV weighting — how per-PC contributions are weighted
-
-Five modes in `_sv_weights` ([subspace_loss.py:13](../asd/losses/subspace_loss.py#L13)):
-
-| mode | formula | interpretation |
-|---|---|---|
-| `uniform` | `w_i = 1` | Euclidean MSE in subspace |
-| `linear` | `w_i ∝ λ_i` | dominated by top 1-2 PCs |
-| `sqrt` (old default) | `w_i ∝ √λ_i` | mild top-PC bias |
-| **`mahalanobis`** (v3) | `w_i ∝ 1/λ_i` | Mahalanobis distance — all directions equally weighted in std-units |
-| `inv_sqrt` | `w_i ∝ 1/√λ_i` | half-whitening |
-
-Mahalanobis is equivalent to MSE on `Λ^(-1/2) Vᵀ x_t` (whitened teacher
-projections). A numerical floor at `1e-6 · λ_max` prevents noise-floor
-directions from blowing up the inverted weight.
-
-Empirical finding: Mahalanobis substantially outperforms sqrt on GPT-2/
-WikiText-2 (ppl 131 vs 486 at τ=0.95, same student arch). See
-[findings.md](findings.md).
-
-### L_sparsity — histogram matching
-
-Soft differentiable histograms of student vs teacher per-layer activations;
-KL divergence between them plus a BCE/MSE term on sparsity ratios. Ablation
-shows contribution within noise; the v3 recipe sets γ=0.
-
-### L_logit_kd — Hinton distillation
-
-```
-L_kd = T² · KL(softmax(t_logits/T) ‖ softmax(s_logits/T))
-```
-Default T=4. Note: the 2026-04-22 ablation matrix found KD to be net-
-*negative* when combined with L_subspace. See Finding 1 in
-[findings.md](findings.md). v3 recipe sets δ=0.
-
-### L_relation and L_attention
-
-Opt-in baselines (`ε > 0` or `ζ > 0`), used primarily for comparison:
-
-- **Relational KD** (Park et al. 2019) — pairwise distances + triplet angles
-  on GAP features. `RelationalLoss` in [relation_loss.py](../asd/losses/relation_loss.py).
-- **Attention Transfer** (Zagoruyko & Komodakis 2017) — L2-normalized
-  channel-aggregated spatial maps. `AttentionTransferLoss` in
-  [attention_loss.py](../asd/losses/attention_loss.py).
-
-On the benchmark matrix, AT beats the full ASD recipe at τ=0.85 (91.40 vs
-90.78 3-seed avg) and ties at τ=0.95 (92.40 vs 92.13). Motivates Finding 3.
-
-### Combination strategies
-
-Two modes selected by `training.combination`:
-
-- **`fixed` (default)** — weighted sum with the literal α, β, γ, δ. Schedulers
-  apply warmup to β and γ (`β(t) = β · min(1, t/β_warmup_epochs)` etc).
-- **`uncertainty`** — Kendall & Gal (2018). Each loss carries a learnable
-  `s_i = log σ_i²`; total is `Σ 0.5·exp(−s_i)·L_i + 0.5·s_i`. Self-balances
-  across loss scales. Historically under-delivered vs well-tuned fixed weights.
-
-### Auto-normalization
-
-`auto_normalize: true` divides each component by its EMA magnitude before
-the weighted sum. Lets α, β, γ, δ express *relative* priorities rather
-than absolute scales. Useful when comparing across datasets / teachers.
+- [`asd/profiling/activation_capture.py`](../asd/profiling/activation_capture.py)
+  — forward-hook accumulator, `CovarianceAccumulator`.
+- [`asd/profiling/svd_analysis.py`](../asd/profiling/svd_analysis.py) —
+  `SVDAnalyzer` with MP and Ledoit-Wolf options.
+- [`asd/profiling/stability.py`](../asd/profiling/stability.py) —
+  optional diagnostic: bootstrap principal-angle stability across
+  calibration splits.
+- [`asd/api.py`](../asd/api.py) — `profile`, `capture`, `SubspaceLoss`,
+  `distill`, `TeacherProfile` — the public surface.
+- [`asd/autodetect.py`](../asd/autodetect.py) — layer auto-detection
+  for known model families.
+- [`asd/builders.py`](../asd/builders.py) — student constructors for
+  torchvision ResNets and HuggingFace GPT-2.
+- [`asd/models/student.py`](../asd/models/student.py) — `SlimNet`, the
+  4-stage ResNet student used by `build_student` for CNN teachers.

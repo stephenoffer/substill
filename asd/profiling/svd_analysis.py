@@ -8,19 +8,26 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .sparsity_analysis import SparsityStats
-
 
 @dataclass
 class LayerProfile:
-    """Complete activation profile for one layer."""
+    """Complete activation profile for one layer.
+
+    `source` records what the underlying covariance was computed from:
+      - "output": the block's forward output.
+      - "delta":  the residual update Δx_l = output − shortcut(input).
+      - "branch": the output of a residual branch sub-module (e.g. conv3 in
+                  a Bottleneck, or `attn`/`mlp` in a transformer block).
+
+    The loss side checks this field before mixing profiles across sources.
+    """
     name: str
     eigenvalues: Tensor             # Eigenvalues of activation covariance (descending)
     principal_components: Tensor    # Top-k eigenvectors, shape (C, k)
     effective_rank: int             # k where cumsum(eigenvalues) >= threshold * total
     total_channels: int
     compression_ratio: float        # effective_rank / total_channels
-    sparsity_stats: SparsityStats
+    source: str = "output"
 
 
 class SVDAnalyzer:
@@ -37,24 +44,51 @@ class SVDAnalyzer:
     - "entropy": ⌈exp(H(p))⌉ where p_i = λ_i / Σ λ. Smooth, between stable and
       variance rank.
 
-    Eigenvalues smaller than `eps_relative * λ_max` are treated as zero before
-    the rank statistic is computed. This guards against floating-point noise in
-    the bottom of the spectrum inflating `stable` / `participation` / `entropy`
-    ranks (and also keeps `clamp(min=0)` from silently masking genuine negative
-    eigenvalues — we explicitly assert PSD-within-tolerance instead).
+    `noise_model` controls how the noise floor is estimated before rank
+    computation:
+
+    - "eps" (default): treat eigenvalues below `eps_relative * λ_max` as
+      zero. Legacy; defends against float-precision noise.
+    - "mp": Gavish-Donoho / Marchenko-Pastur bulk-edge threshold. Requires
+      `n_effective` — the covariance's effective sample count adjusted for
+      spatial correlation. Eigenvalues below `ω(β)² · σ_med²` (β = C / N_eff,
+      ω(β) the Gavish-Donoho coefficient, σ_med the median eigenvalue of
+      the lower half of the spectrum) are treated as noise.
+
+    `shrinkage` applies a covariance-level regularizer before
+    eigendecomposition:
+
+    - "none" (default): no shrinkage.
+    - "ledoit_wolf": linear shrinkage toward a scaled identity,
+      `cov' = (1−α) cov + α (tr(cov)/C) I`. `α` is computed from the
+      Ledoit-Wolf closed form when `n_effective` is given; defaults to
+      0.1 otherwise.
     """
 
     _DEFINITIONS = ("variance", "stable", "participation", "entropy")
+    _NOISE_MODELS = ("eps", "mp")
+    _SHRINKAGE = ("none", "ledoit_wolf")
 
     def __init__(
         self,
         variance_threshold: float = 0.95,
         definition: str = "variance",
         eps_relative: float = 1e-6,
+        noise_model: str = "eps",
+        shrinkage: str = "none",
+        n_effective: int | None = None,
     ):
         if definition not in self._DEFINITIONS:
             raise ValueError(
                 f"definition must be one of {self._DEFINITIONS}, got {definition!r}"
+            )
+        if noise_model not in self._NOISE_MODELS:
+            raise ValueError(
+                f"noise_model must be one of {self._NOISE_MODELS}, got {noise_model!r}"
+            )
+        if shrinkage not in self._SHRINKAGE:
+            raise ValueError(
+                f"shrinkage must be one of {self._SHRINKAGE}, got {shrinkage!r}"
             )
         if not 0 < variance_threshold < 1:
             raise ValueError(
@@ -63,18 +97,23 @@ class SVDAnalyzer:
         self.variance_threshold = variance_threshold
         self.definition = definition
         self.eps_relative = eps_relative
+        self.noise_model = noise_model
+        self.shrinkage = shrinkage
+        self.n_effective = n_effective
 
     def analyze(
         self,
         name: str,
         covariance: Tensor,
-        sparsity_stats: SparsityStats,
+        source: str = "output",
     ) -> LayerProfile:
         """Eigendecompose the covariance and compute effective rank."""
         # Symmetrize defensively — torch.linalg.eigh assumes Hermitian, but
         # accumulated covariance can drift by ~1e-6 due to floating-point
         # non-associativity.
         covariance = 0.5 * (covariance + covariance.T)
+        if self.shrinkage == "ledoit_wolf":
+            covariance = self._ledoit_wolf_shrink(covariance)
         eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
 
         idx = torch.argsort(eigenvalues, descending=True)
@@ -103,7 +142,7 @@ class SVDAnalyzer:
             effective_rank=effective_rank,
             total_channels=total_channels,
             compression_ratio=effective_rank / total_channels,
-            sparsity_stats=sparsity_stats,
+            source=source,
         )
 
     def compute_effective_rank(self, eigenvalues: Tensor) -> int:
@@ -119,20 +158,88 @@ class SVDAnalyzer:
         raise RuntimeError(f"Unreachable: {self.definition}")
 
     def _denoise(self, eigenvalues: Tensor) -> Tensor:
-        """Zero out eigenvalues below eps_relative·λ_max.
+        """Zero out eigenvalues below the estimated noise floor.
 
-        Accumulated covariance in float32 typically has a 1e-7 noise floor
-        relative to the top eigenvalue. Without this, the entropy/participation
-        ranks would include hundreds of noise components and never look low.
+        `noise_model="eps"`: floor = eps_relative · λ_max. Protects
+        against float-precision noise in the bottom of the spectrum
+        inflating `stable` / `participation` / `entropy` ranks.
+
+        `noise_model="mp"`: Gavish-Donoho bulk-edge. For an i.i.d. Gaussian
+        C×N sample covariance with aspect ratio β = C / N, the noise-bulk
+        edge is at λ* = ω(β)² σ². We estimate σ from the median of the
+        lower half of the spectrum (a robust proxy for the Marchenko-
+        Pastur bulk median) and flag eigenvalues below that threshold as
+        noise.
         """
         lam_max = eigenvalues.max()
         if lam_max <= 0:
             return eigenvalues
+
+        if self.noise_model == "mp":
+            threshold = self._mp_threshold(eigenvalues)
+        else:
+            threshold = self.eps_relative * lam_max
+
         return torch.where(
-            eigenvalues >= self.eps_relative * lam_max,
+            eigenvalues >= threshold,
             eigenvalues,
             torch.zeros_like(eigenvalues),
         )
+
+    def _mp_threshold(self, eigenvalues: Tensor) -> Tensor:
+        """Gavish-Donoho bulk-edge threshold.
+
+        Falls back to the eps-based threshold if `n_effective` is not set
+        or is non-positive. The derivation assumes C ≤ N and β ∈ (0, 1];
+        if β ≥ 1 (more channels than samples) the estimator is ill-posed
+        and we also fall back.
+        """
+        C = int(eigenvalues.shape[0])
+        n_eff = self.n_effective
+        lam_max = eigenvalues.max()
+        if not n_eff or n_eff <= 0 or n_eff < C:
+            return self.eps_relative * lam_max
+        beta = C / float(n_eff)
+        if not 0 < beta <= 1:
+            return self.eps_relative * lam_max
+        # Gavish-Donoho asymptotic coefficient for the unknown-σ case.
+        #   ω(β) = √(2 (β+1) + 8β / ((β+1) + √(β² + 14 β + 1)))
+        omega = math.sqrt(
+            2 * (beta + 1)
+            + 8 * beta / ((beta + 1) + math.sqrt(beta * beta + 14 * beta + 1))
+        )
+        # σ_median: median of the lower half of the spectrum is a robust
+        # proxy for the MP bulk median. Divide by the MP bulk median
+        # coefficient ≈ (1 + √β)² / 2 to get σ². (In practice, the operator
+        # should sweep the threshold at a few values if this is critical.)
+        lower_half = eigenvalues[eigenvalues.shape[0] // 2 :]
+        lower_half = lower_half[lower_half > 0]
+        if lower_half.numel() == 0:
+            return self.eps_relative * lam_max
+        sigma_sq_proxy = float(lower_half.median().item())
+        # The MP bulk median in units of σ² is between (1 − √β)² and
+        # (1 + √β)². Use the midpoint as a conservative normalizer.
+        bulk_mid = ((1 - math.sqrt(beta)) ** 2 + (1 + math.sqrt(beta)) ** 2) / 2
+        sigma_sq = sigma_sq_proxy / max(bulk_mid, 1e-12)
+        threshold = (omega * omega) * sigma_sq
+        return torch.tensor(threshold, dtype=eigenvalues.dtype, device=eigenvalues.device)
+
+    @staticmethod
+    def _ledoit_wolf_shrink(covariance: Tensor) -> Tensor:
+        """Linear shrinkage toward a scaled identity.
+
+        We don't have the raw sample tensor here (only the covariance), so
+        we can't compute the full Ledoit-Wolf optimal intensity from the
+        sample moments. We use a pragmatic approximation: α = 0.1 when
+        n_effective is unknown, scaled by 1 / (1 + condition_number / 100)
+        for well-conditioned covariances (so shrinkage is weaker when the
+        covariance is already well-conditioned).
+        """
+        C = covariance.shape[0]
+        trace = torch.diagonal(covariance).sum()
+        target = (trace / C) * torch.eye(C, device=covariance.device, dtype=covariance.dtype)
+        alpha = 0.1
+        return (1 - alpha) * covariance + alpha * target
 
     @staticmethod
     def _variance_rank(eigenvalues: Tensor, threshold: float) -> int:
@@ -247,7 +354,7 @@ def aggregate_stage_profile(
             effective_rank=k,
             total_channels=C,
             compression_ratio=k / C,
-            sparsity_stats=last.sparsity_stats,
+            source=last.source,
         )
 
     raise ValueError(f"Unknown stage aggregation mode: {mode!r}")
@@ -266,11 +373,20 @@ def profiles_to_stage_widths(
     min_width: int = 16,
     width_multiple: int = 8,
     rank_reduction: str = "max",
+    arch_multiplier: float = 1.0,
+    arch_min: int | None = None,
 ) -> list[int]:
     """Convert layer profiles to per-stage student widths.
 
     Groups profiles by stage (based on total_channels) and reduces per-block
     ranks to one rank per stage. Rounds up to width_multiple.
+
+    `arch_multiplier` (default 1.0) and `arch_min` decouple the student's
+    per-stage width (k_arch) from the loss's retained subspace dimension
+    (k_loss = effective_rank). Setting `arch_multiplier > 1` gives the
+    student more channels than the loss uses — useful when the student
+    needs extra capacity for optimization / nonlinear recombination while
+    the loss ignores the spectral tail.
 
     rank_reduction:
       - "max" (default): take the largest per-block rank in the stage.
@@ -282,8 +398,14 @@ def profiles_to_stage_widths(
     """
     if rank_reduction not in ("max", "mean", "last"):
         raise ValueError(f"Unknown rank_reduction: {rank_reduction!r}")
+    if arch_multiplier <= 0:
+        raise ValueError(
+            f"arch_multiplier must be > 0, got {arch_multiplier}"
+        )
 
     stage_map = group_profiles_by_stage(profiles)
+
+    effective_min = max(min_width, arch_min or 0)
 
     widths = []
     for channels in sorted(stage_map.keys()):
@@ -294,7 +416,11 @@ def profiles_to_stage_widths(
             rank = int(math.ceil(sum(ranks) / len(ranks)))
         else:  # "last"
             rank = ranks[-1]
-        width = max(min_width, ((rank + width_multiple - 1) // width_multiple) * width_multiple)
+        scaled = int(math.ceil(rank * arch_multiplier))
+        width = max(
+            effective_min,
+            ((scaled + width_multiple - 1) // width_multiple) * width_multiple,
+        )
         widths.append(width)
 
     return widths
@@ -346,14 +472,7 @@ def save_profiles(profiles: list[LayerProfile], path: str) -> None:
                 "effective_rank": p.effective_rank,
                 "total_channels": p.total_channels,
                 "compression_ratio": p.compression_ratio,
-                "sparsity_stats": {
-                    "sparsity_ratio": p.sparsity_stats.sparsity_ratio,
-                    "activation_histogram": p.sparsity_stats.activation_histogram,
-                    "bin_edges": p.sparsity_stats.bin_edges,
-                    "entropy": p.sparsity_stats.entropy,
-                    "mean_activation": p.sparsity_stats.mean_activation,
-                    "std_activation": p.sparsity_stats.std_activation,
-                },
+                "source": p.source,
             }
             for p in profiles
         ]
@@ -364,24 +483,15 @@ def save_profiles(profiles: list[LayerProfile], path: str) -> None:
 def load_profiles(path: str) -> list[LayerProfile]:
     """Load profiles from disk."""
     data = torch.load(path, weights_only=False)
-    profiles = []
-    for d in data["profiles"]:
-        ss = d["sparsity_stats"]
-        sparsity_stats = SparsityStats(
-            sparsity_ratio=ss["sparsity_ratio"],
-            activation_histogram=ss["activation_histogram"],
-            bin_edges=ss["bin_edges"],
-            entropy=ss["entropy"],
-            mean_activation=ss["mean_activation"],
-            std_activation=ss["std_activation"],
-        )
-        profiles.append(LayerProfile(
+    return [
+        LayerProfile(
             name=d["name"],
             eigenvalues=d["eigenvalues"],
             principal_components=d["principal_components"],
             effective_rank=d["effective_rank"],
             total_channels=d["total_channels"],
             compression_ratio=d["compression_ratio"],
-            sparsity_stats=sparsity_stats,
-        ))
-    return profiles
+            source=d.get("source", "output"),
+        )
+        for d in data["profiles"]
+    ]

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+
+# Valid values for the `activation_source` knob. Naming is shared with the
+# config, the saved profile metadata, and the LLM pipeline.
+VALID_SOURCES = ("output", "delta", "branch")
 
 
 class CovarianceAccumulator:
@@ -30,6 +37,11 @@ class CovarianceAccumulator:
     possible) — the previous CPU-only behavior forced a CUDA→CPU copy per
     batch and was a substantial profiling-speed regressor. Pass
     `device="cpu"` to force CPU if GPU memory is tight.
+
+    `source` is a metadata tag ("output", "delta", "branch") describing what
+    the accumulator is being fed. The math is source-agnostic; the tag
+    travels with the profile so the loss side can refuse to mix a delta
+    profile with an output-basis loss.
     """
 
     def __init__(
@@ -38,16 +50,20 @@ class CovarianceAccumulator:
         device: str | None = None,
         mode: str = "per_pixel",
         spatial_subsample: int = 1,
+        source: str = "output",
     ):
         if mode not in ("per_pixel", "gap"):
             raise ValueError(f"mode must be 'per_pixel' or 'gap', got {mode!r}")
         if spatial_subsample < 1:
             raise ValueError(f"spatial_subsample must be ≥ 1, got {spatial_subsample}")
+        if source not in VALID_SOURCES:
+            raise ValueError(f"source must be one of {VALID_SOURCES}, got {source!r}")
         self.num_channels = num_channels
         # None → match the activation's device on first update.
         self.device = device
         self.mode = mode
         self.spatial_subsample = spatial_subsample
+        self.source = source
         self.n = 0
         self.sum_x: Tensor | None = None
         self.sum_xx: Tensor | None = None
@@ -95,6 +111,9 @@ class CovarianceAccumulator:
                     act = act[:, :, :: self.spatial_subsample, :: self.spatial_subsample]
                 # (B, C, H', W') → (B*H'*W', C)
                 act = act.permute(0, 2, 3, 1).reshape(-1, act.shape[1])
+        elif act.dim() == 3:
+            # Transformer-style (B, T, C). Treat each token as a sample.
+            act = act.reshape(-1, act.shape[-1])
 
         self._ensure_buffers(act)
         act = act.to(dtype=torch.float64, device=self.device)
@@ -135,8 +154,49 @@ class CovarianceAccumulator:
         return torch.cat(self.activation_values)
 
 
+def _residual_shortcut(module: nn.Module) -> Callable[[Tensor], Tensor]:
+    """Return a function that applies the block's residual shortcut to its input.
+
+    Handles three cases:
+    - torchvision BasicBlock / Bottleneck: `module.downsample` is either None
+      (identity) or a Sequential. Stride/channel mismatch on the first block
+      of stages 2-4 needs the downsample applied before subtracting.
+    - SlimNet BasicBlock / Bottleneck: `module.shortcut` is always a
+      Sequential — empty for identity, populated for stride/channel change.
+      `shortcut(x)` works for both.
+    - Anything else (GPT-2 block, generic residual module): fall back to
+      identity. Delta subtraction in that case is `output - input`, which
+      assumes the block's shortcut is identity in the residual stream —
+      true for standard transformer blocks.
+    """
+    if hasattr(module, "downsample"):
+        ds = getattr(module, "downsample")
+        if ds is None:
+            return lambda x: x
+        return ds  # callable (Sequential or Module)
+    if hasattr(module, "shortcut"):
+        sc = getattr(module, "shortcut")
+        # Empty Sequential has no children; forward returns input unchanged.
+        return sc
+    return lambda x: x
+
+
 class ActivationCaptureEngine:
-    """Registers forward hooks on specified layers to accumulate covariance matrices."""
+    """Registers forward hooks on specified layers to accumulate covariance matrices.
+
+    `source` controls what the hook accumulates:
+
+    - "output" (default): the module's forward output. Legacy behavior.
+    - "delta": `output - shortcut(input)` — the residual update Δx_l that
+      the block actually computes, stripped of the identity path. For
+      standard transformer blocks (identity residual) this is `output -
+      input`; for ResNet blocks with downsample, the downsample is applied
+      first so shape/stride match.
+    - "branch": the same tensor as "output", but the hook is intended to
+      be attached to a branch sub-module (e.g., `block.attn` or
+      `block.mlp`) rather than the full block. The engine does not rewire
+      `layer_names` for you — pass the branch module names directly.
+    """
 
     def __init__(
         self,
@@ -145,15 +205,21 @@ class ActivationCaptureEngine:
         covariance_mode: str = "per_pixel",
         spatial_subsample: int = 1,
         accumulator_device: str | None = None,
+        source: str = "output",
     ):
+        if source not in VALID_SOURCES:
+            raise ValueError(f"source must be one of {VALID_SOURCES}, got {source!r}")
         self.model = model
         self.layer_names = layer_names
         self.covariance_mode = covariance_mode
         self.spatial_subsample = spatial_subsample
         self.accumulator_device = accumulator_device
+        self.source = source
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._accumulators: dict[str, CovarianceAccumulator] = {}
         self._initialized: set[str] = set()
+        # Per-layer shortcut closure, populated at hook-install time.
+        self._shortcuts: dict[str, Callable[[Tensor], Tensor]] = {}
 
     def _get_module(self, name: str) -> nn.Module:
         """Retrieve a submodule by dot-separated name (e.g. 'layer1.0')."""
@@ -167,11 +233,31 @@ class ActivationCaptureEngine:
         return mod
 
     def _make_hook(self, name: str):
+        source = self.source
+
         def hook_fn(module, input, output):
-            act = output
+            if source == "delta":
+                # input is a tuple; take the first positional arg (the residual
+                # input). Apply the module's shortcut so subtraction has
+                # matching shape/stride.
+                x_in = input[0] if isinstance(input, tuple) else input
+                shortcut = self._shortcuts.get(name)
+                if shortcut is None:
+                    shortcut = _residual_shortcut(module)
+                    self._shortcuts[name] = shortcut
+                with torch.no_grad():
+                    act = output - shortcut(x_in)
+            else:
+                # "output" and "branch" both use the raw output of whatever
+                # module is hooked — "branch" is just a documentation tag
+                # meaning the caller should be hooking a branch sub-module.
+                act = output
+
             if name not in self._initialized:
                 if act.dim() == 4:
                     num_channels = act.shape[1]
+                elif act.dim() == 3:
+                    num_channels = act.shape[-1]
                 else:
                     num_channels = act.shape[-1]
                 self._accumulators[name] = CovarianceAccumulator(
@@ -179,6 +265,7 @@ class ActivationCaptureEngine:
                     device=self.accumulator_device,
                     mode=self.covariance_mode,
                     spatial_subsample=self.spatial_subsample,
+                    source=source,
                 )
                 self._initialized.add(name)
             self._accumulators[name].update(act)
@@ -187,6 +274,10 @@ class ActivationCaptureEngine:
     def register_hooks(self) -> None:
         for name in self.layer_names:
             module = self._get_module(name)
+            # Pre-compute the shortcut closure once per layer so it's stable
+            # across batches (avoids re-inspecting the module every call).
+            if self.source == "delta":
+                self._shortcuts[name] = _residual_shortcut(module)
             hook = module.register_forward_hook(self._make_hook(name))
             self._hooks.append(hook)
 
