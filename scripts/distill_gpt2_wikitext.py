@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end GPT-2 / WikiText-2 distillation example using the `asd` library.
+"""End-to-end GPT-2 / WikiText-2 distillation example using the ``asd`` library.
+
+Usage::
 
     pip install transformers datasets
     python scripts/distill_gpt2_wikitext.py --epochs 3
 
-Produces a narrower GPT-2 student and prints best validation perplexity.
+Writes a narrower GPT-2 student and prints the best validation perplexity.
 """
 
 from __future__ import annotations
@@ -99,7 +101,6 @@ def main():
     loaders = get_dataloaders(args.batch_size, args.seq_len)
     print(f"teacher: {sum(p.numel() for p in teacher.parameters()):,} params")
 
-    # --- profile ---
     print(f"\nprofiling teacher over {args.profile_batches} batches...")
     t0 = time.time()
     profile = asd.profile(

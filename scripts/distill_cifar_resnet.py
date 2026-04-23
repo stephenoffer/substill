@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end CIFAR-10 distillation example using the `asd` library.
+"""End-to-end CIFAR-10 distillation example using the ``asd`` library.
+
+Usage::
 
     python scripts/finetune_teacher.py --output outputs/teacher.pt
-    python scripts/distill_cifar_resnet.py \\
-        --teacher outputs/teacher.pt --epochs 20
+    python scripts/distill_cifar_resnet.py --teacher outputs/teacher.pt --epochs 20
 
-Outputs a trained student checkpoint and prints final accuracy.
+Writes a trained student checkpoint and prints final accuracy.
 """
 
 from __future__ import annotations
@@ -104,12 +105,12 @@ def main():
     ).to(device)
     s_params = sum(p.numel() for p in student.parameters())
     t_params = sum(p.numel() for p in teacher.parameters())
-    print(f"student: {s_params:,} params ({t_params/s_params:.2f}× compression)")
+    print(f"student: {s_params:,} params ({t_params / s_params:.2f}x compression)")
 
     # Loss (with projectors as parameters)
     loss_fn = asd.SubspaceLoss(profile, objective=args.objective).to(device)
 
-    # Run one dummy forward to build projectors before we construct the optimizer.
+    # One forward pass to build the projectors before the optimizer is created.
     x0, _ = next(iter(loaders["train"]))
     x0 = x0.to(device)
     with asd.capture(teacher, profile) as t_cap0:

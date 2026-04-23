@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Adapt a torchvision ResNet to CIFAR-10 so it's a useful distillation teacher.
+"""Adapt a torchvision ResNet to CIFAR-10 to serve as a distillation teacher.
 
-Torchvision ResNets ship with an ImageNet-style 7×7 stride-2 stem and a
-1000-class classifier. For CIFAR-10 (32×32 inputs, 10 classes) we swap
-the stem for a 3×3 stride-1 conv and replace the classifier head, then
-fine-tune. The resulting checkpoint is ready to feed into `asd.profile`.
+Torchvision ResNets ship with an ImageNet-style 7x7 stride-2 stem and
+a 1000-class classifier. For CIFAR-10 (32x32 inputs, 10 classes) we
+swap the stem for a 3x3 stride-1 conv, drop the maxpool, and replace
+the classifier head, then fine-tune. The resulting checkpoint feeds
+into ``asd.profile``.
 
-Usage:
-    python scripts/finetune_teacher.py \\
-        --epochs 8 --output outputs/teacher.pt
+Usage::
+
+    python scripts/finetune_teacher.py --epochs 8 --output outputs/teacher.pt
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from asd.data.cifar10 import get_cifar10_loaders
 
 
 def adapt_resnet_for_cifar(resnet: nn.Module, num_classes: int = 10) -> nn.Module:
-    """Replace the 7×7 stem with a 3×3 stride-1 conv, drop the maxpool,
+    """Replace the 7x7 stem with a 3x3 stride-1 conv, drop the maxpool,
     and replace the classifier head. Works on any torchvision ResNet."""
     first_out = resnet.conv1.out_channels
     resnet.conv1 = nn.Conv2d(3, first_out, 3, stride=1, padding=1, bias=False)

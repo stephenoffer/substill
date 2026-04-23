@@ -1,4 +1,4 @@
-"""CIFAR-10 / CIFAR-100 / SVHN data loaders for ASD training, profiling, and evaluation."""
+"""CIFAR-10 / CIFAR-100 / SVHN data loaders for training, profiling, and evaluation."""
 
 from __future__ import annotations
 
@@ -8,19 +8,18 @@ from torchvision import datasets, transforms
 
 
 def _svhn(root, train, download, transform):
-    """SVHN wrapper that mimics the CIFAR dataset API (train=True/False)."""
+    """SVHN wrapper that mimics the CIFAR dataset API."""
     split = "train" if train else "test"
     return datasets.SVHN(root=root, split=split, download=download, transform=transform)
 
 
-# Per-dataset normalization stats
 _STATS = {
     "cifar10": {
         "mean": (0.4914, 0.4822, 0.4465),
         "std": (0.2470, 0.2435, 0.2616),
         "cls": datasets.CIFAR10,
         "num_classes": 10,
-        "augment": "standard",  # RandomCrop(4) + HFlip
+        "augment": "standard",
     },
     "cifar100": {
         "mean": (0.5071, 0.4866, 0.4409),
@@ -34,7 +33,7 @@ _STATS = {
         "std": (0.1980, 0.2010, 0.1970),
         "cls": _svhn,
         "num_classes": 10,
-        # No HFlip for SVHN — digits don't look the same flipped.
+        # No horizontal flip for SVHN: digits are not reflection-symmetric.
         "augment": "svhn",
     },
 }
@@ -59,9 +58,8 @@ def _build_transform(augmentation: str, mean, std) -> transforms.Compose:
             normalize,
         ])
     if augmentation == "strong":
-        # Stronger augmentation — RandAugment adds photometric variety that
-        # shifts the teacher's soft-label manifold; especially helpful for the
-        # student at high compression where it has to learn robust features.
+        # RandAugment adds photometric variety that shifts the teacher's
+        # soft-label manifold; helpful for the student at high compression.
         return transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
@@ -92,8 +90,8 @@ def get_cifar_loaders(
     stats = _STATS[dataset]
     cls = stats["cls"]
 
-    # If caller asks for "standard" on a dataset with a different default aug
-    # (e.g. SVHN doesn't want HFlip), honor the dataset's preference.
+    # Honor the dataset's preferred augmentation when the caller passes
+    # "standard" but the dataset overrides (SVHN skips horizontal flip).
     effective_aug = augmentation
     if augmentation == "standard" and stats.get("augment") != "standard":
         effective_aug = stats["augment"]
@@ -136,22 +134,23 @@ def get_cifar10_loaders(
     augmentation: str = "standard",
     calibration_samples: int | None = None,
 ) -> dict[str, DataLoader]:
-    """Build CIFAR-10 train/test loaders (and optional calibration loader).
+    """Build CIFAR-10 train/test loaders, plus an optional calibration loader.
 
     Args:
         data_dir: Directory to download CIFAR-10 into (created if missing).
         batch_size: Batch size for all loaders.
         num_workers: DataLoader worker count.
-        augmentation: "standard" (random crop + flip) or "none" (normalize only).
-            Applied only to the training loader. Test/calibration always use "none".
-        calibration_samples: If set, also return a "calibration" loader — a
-            deterministic random subset of the training set with no augmentation,
-            used for activation profiling.
+        augmentation: ``"standard"`` (random crop + flip) or ``"none"``
+            (normalize only). Applied only to the training loader. Test
+            and calibration always use ``"none"``.
+        calibration_samples: If set, return a ``"calibration"`` loader:
+            a deterministic random subset of the training set with no
+            augmentation, used for activation profiling.
 
     Returns:
-        Dict with keys "train", "test", and optionally "calibration".
+        Dict with keys ``"train"``, ``"test"``, and optionally
+        ``"calibration"``.
     """
-    # Legacy wrapper around get_cifar_loaders for CIFAR-10.
     return get_cifar_loaders(
         dataset="cifar10",
         data_dir=data_dir,
@@ -160,5 +159,3 @@ def get_cifar10_loaders(
         augmentation=augmentation,
         calibration_samples=calibration_samples,
     )
-
-

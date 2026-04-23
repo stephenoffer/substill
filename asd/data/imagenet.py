@@ -1,19 +1,21 @@
-"""ImageNet loader that streams from s3://ray-example-data/imagenet/.
+"""ImageNet loader that streams from ``s3://ray-example-data/imagenet/``.
 
-The reference bucket ships a parquet file with 803k training-image URLs (one
-per row, as `image_url`). Labels are inferred from the WordNet ID embedded in
-the URL path (`.../train/<wnid>/<image>.JPEG`). Since the `test/` split in that
-bucket has no public labels, we hold out `val_per_class` images per class from
-the training URLs as a deterministic validation set.
+The reference bucket ships a parquet file with 803k training-image
+URLs (one per row, as ``image_url``). Labels are inferred from the
+WordNet ID embedded in the URL path
+(``.../train/<wnid>/<image>.JPEG``). The ``test/`` split in that
+bucket has no public labels, so we hold out ``val_per_class`` images
+per class from the training URLs as a deterministic validation set.
 
-Key design notes:
+Design notes:
 
-- Reads are anonymous (the bucket is public). We use boto3 with UNSIGNED
-  config — lighter than fsspec and one connection per worker process.
-- On-disk cache in `cache_dir` lets multi-epoch training avoid re-downloading
-  (first epoch is I/O-bound; subsequent epochs run at GPU speed).
-- The cache is content-addressed by the S3 key path, so it's safe to share
-  across different subsample sizes or splits.
+- Reads are anonymous (the bucket is public). Uses boto3 with an
+  UNSIGNED config: lighter than fsspec and one connection per worker
+  process.
+- On-disk cache in ``cache_dir`` avoids re-downloading across epochs.
+  The first epoch is I/O-bound; subsequent epochs run at GPU speed.
+- The cache is content-addressed by S3 key path, so it is safe to
+  share across different subsample sizes or splits.
 """
 
 from __future__ import annotations
@@ -29,13 +31,11 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-# Standard ImageNet normalization (matches torchvision pretrained weights)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 _WNID_RE = re.compile(r"/train/([^/]+)/")
 
-# Default S3 bucket + parquet key
 DEFAULT_BUCKET = "ray-example-data"
 DEFAULT_PARQUET_KEY = "imagenet/metadata_file.parquet"
 
@@ -55,8 +55,9 @@ def _s3_anon_client():
 
 
 def _url_to_bucket_key(url: str) -> tuple[str, str]:
-    # s3://bucket/key/path.jpg -> ("bucket", "key/path.jpg")
-    assert url.startswith("s3://"), url
+    """Split ``s3://bucket/key/path.jpg`` into ``("bucket", "key/path.jpg")``."""
+    if not url.startswith("s3://"):
+        raise ValueError(f"not an s3 URL: {url!r}")
     body = url[len("s3://") :]
     bucket, _, key = body.partition("/")
     return bucket, key
@@ -81,10 +82,12 @@ def build_splits(
     seed: int = 0,
     max_classes: int | None = None,
 ) -> tuple[ImageNetSplit, ImageNetSplit]:
-    """Group all train-URL parquet rows by wnid, then hold `val_per_class` out
-    per class for validation and keep (up to) `train_per_class` for training.
-    Deterministic under `seed`. If `max_classes` is set, restrict to that many
-    classes alphabetically (useful for smoke tests).
+    """Split the parquet URL list into train and validation per class.
+
+    Groups all URLs by wnid, holds ``val_per_class`` out per class for
+    validation, and keeps up to ``train_per_class`` for training.
+    Deterministic under ``seed``. If ``max_classes`` is set, restricts
+    to that many classes alphabetically (useful for smoke tests).
     """
     urls = _load_metadata()
     by_wnid: dict[str, list[str]] = defaultdict(list)
@@ -133,7 +136,7 @@ class S3ImageNet(Dataset):
         self.cache_dir = cache_dir
         self.transform = transform
         os.makedirs(cache_dir, exist_ok=True)
-        self._client = None  # Lazy per-worker
+        self._client = None
 
     def __len__(self) -> int:
         return len(self.urls)
@@ -153,7 +156,7 @@ class S3ImageNet(Dataset):
         buf = io.BytesIO()
         self._ensure_client().download_fileobj(bucket, key, buf)
         data = buf.getvalue()
-        # Write atomically: temp file + rename.
+        # Atomic write: temp file plus rename.
         tmp = cache_path + f".tmp.{os.getpid()}"
         with open(tmp, "wb") as f:
             f.write(data)
@@ -198,11 +201,12 @@ def get_imagenet_loaders(
     max_classes: int | None = None,
     seed: int = 0,
 ) -> dict[str, DataLoader]:
-    """Build train / test / (optional) calibration loaders streaming from S3.
+    """Build train, test, and optional calibration loaders streaming from S3.
 
-    Returns dict with keys "train", "test", and (if calibration_samples is set)
-    "calibration". The "test" loader uses the val-per-class hold-out — the
-    upstream `test/` prefix has no labels.
+    Returns a dict with keys ``"train"``, ``"test"``, and (when
+    ``calibration_samples`` is set) ``"calibration"``. The ``"test"``
+    loader uses the val-per-class hold-out because the upstream
+    ``test/`` prefix has no labels.
     """
     train_split, val_split = build_splits(
         train_per_class=train_per_class,

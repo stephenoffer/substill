@@ -1,19 +1,17 @@
 """Activation Subspace Distillation (ASD).
 
-Compress a PyTorch teacher model by distilling inside its activation
+Compress a PyTorch teacher by distilling inside its activation
 subspace. Works on torchvision ResNets, HuggingFace GPT-2 / Llama /
-Mistral-style transformers, and any nn.Module where you can point at
-a list of "stage" or "block" modules.
+Mistral transformers, and any ``nn.Module`` where you can point at a
+list of block or stage modules.
 
-## Minimal usage
+Minimal usage::
 
     import asd
 
-    # 1. Profile the teacher once.
     profile = asd.profile(teacher, calibration_loader,
                           source="delta", noise_model="mp")
 
-    # 2. Plug the subspace loss into your training loop.
     loss_fn = asd.SubspaceLoss(profile, objective="cka")
     for x, y in loader:
         with asd.capture(teacher, profile) as t_hid:
@@ -25,28 +23,35 @@ a list of "stage" or "block" modules.
         )
         loss.backward()
 
-    # 3. Or go one call:
+    # Or the one-call pipeline:
     result = asd.distill(teacher, student, train_loader, epochs=20)
 
-## Public API
+Public API:
 
-- `profile(...)` — run the teacher over a calibration loader and return
-  a `TeacherProfile` with per-layer principal components, eigenvalues,
-  effective ranks.
-- `TeacherProfile` — save/load-able snapshot of what a teacher computed.
-- `capture(model, profile)` — context manager that hooks `model` at the
-  same layer names as the profile and exposes hidden states.
-- `SubspaceLoss(profile, objective=...)` — `nn.Module` feature-
-  distillation loss you add to your training step.
-- `build_student(template, profile)` — narrow-student constructor for
-  known families (torchvision ResNets, HF GPT-2).
-- `distill(teacher, student, loader, ...)` — batteries-included one-
-  call pipeline (profile → loss → train) for classification tasks.
-- `autodetect_layers(model)` — propose layer names for known model
-  families.
-- `register_detector(family, fn)` — add your own layer detector.
+``profile(...)``
+    Run the teacher over a calibration loader and return a
+    ``TeacherProfile`` with per-layer principal components,
+    eigenvalues, and effective ranks.
+``TeacherProfile``
+    Save/load-able snapshot of what a teacher computed.
+``capture(model, profile)``
+    Context manager that hooks ``model`` at the same layer names as
+    the profile and exposes hidden states.
+``SubspaceLoss(profile, objective=...)``
+    ``nn.Module`` feature-distillation loss to add to your training
+    step.
+``build_student(template, profile)``
+    Narrow-student constructor for known families (torchvision
+    ResNets, HuggingFace GPT-2).
+``distill(teacher, student, loader, ...)``
+    One-call pipeline (profile, loss, train) for classification
+    tasks.
+``autodetect_layers(model)``
+    Propose layer names for known model families.
+``register_detector(family, fn)``
+    Add a custom layer detector.
 
-Everything else in `asd.*` is implementation detail.
+Everything else in ``asd.*`` is implementation detail.
 """
 
 from .api import (

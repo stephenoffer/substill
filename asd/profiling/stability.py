@@ -1,22 +1,21 @@
 """Subspace-stability diagnostic via principal-angle bootstrap.
 
-Addresses the reviewer's concern that ASD's architecture-sizing step
-rests on a covariance subspace whose stability across profiling splits
-has never been measured. If the top-k subspace wobbles substantially
-when you resample the calibration set, any width claim derived from it
-is on shaky ground.
+Measures whether the top-k subspace used for rank sizing is stable
+under resampling of the calibration set. An unstable subspace
+undermines any width claim derived from it.
 
-Given a teacher, a calibration dataset, and a list of layers to profile:
+Given a teacher, a calibration dataset, and a list of layers to
+profile:
 
-1. Build `n_boot` random half-size calibration subsets.
+1. Build ``n_boot`` random half-size calibration subsets.
 2. Run the capture/SVD pipeline on each.
 3. For every pair of bootstrap runs, compute principal angles between
-   their retained top-k subspaces via `arccos(svd(V_aᵀ V_b).S)`.
+   their retained top-k subspaces via ``arccos(svd(V_a^T V_b).S)``.
 
-Returns per-layer statistics: median angle, P90 angle, and the angle at
-index k-1 (the most unstable retained direction). An operator can then
-cross-reference with the per-stage profile to see whether the worst
-stage is also the most unstable.
+Returns per-layer statistics: median angle, P90 angle, and the angle
+at index ``k - 1`` (the most unstable retained direction). Cross-
+reference with the per-stage profile to see whether the worst stage
+is also the most unstable.
 """
 
 from __future__ import annotations
@@ -30,36 +29,35 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Subset
 
 from .activation_capture import ActivationCaptureEngine
-from .svd_analysis import SVDAnalyzer, LayerProfile
+from .svd_analysis import SVDAnalyzer
 
 
 @dataclass
 class StabilityStats:
     """Per-layer stability summary across bootstrap runs."""
+
     name: str
-    k: int                  # number of retained directions (top-k subspace)
+    k: int
     median_angle_deg: float
     p90_angle_deg: float
     max_angle_deg: float
-    n_pairs: int            # number of subspace-pair comparisons
+    n_pairs: int
 
 
 def _principal_angles(V_a: Tensor, V_b: Tensor) -> Tensor:
     """Return principal angles in degrees, sorted ascending.
 
-    `V_a`, `V_b` are column-orthonormal (C, k). If they have different
-    `k`, the comparison uses min(k_a, k_b) — the smaller subspace is the
-    "hardest-to-hit" one and the trailing cosines from the larger
-    subspace are discarded.
+    ``V_a`` and ``V_b`` are column-orthonormal ``(C, k)``. If they
+    have different ``k``, the comparison uses ``min(k_a, k_b)``: the
+    smaller subspace is the "hardest-to-hit" one and trailing cosines
+    from the larger subspace are discarded.
     """
     k = min(V_a.shape[1], V_b.shape[1])
     if k == 0:
         return torch.zeros(0)
-    M = V_a[:, :k].T @ V_b[:, :k]     # (k, k)
-    s = torch.linalg.svdvals(M)
-    s = s.clamp(-1.0, 1.0)
-    angles_rad = torch.arccos(s)
-    angles_deg = angles_rad * (180.0 / math.pi)
+    M = V_a[:, :k].T @ V_b[:, :k]
+    s = torch.linalg.svdvals(M).clamp(-1.0, 1.0)
+    angles_deg = torch.arccos(s) * (180.0 / math.pi)
     angles_deg, _ = torch.sort(angles_deg)
     return angles_deg
 
@@ -81,18 +79,19 @@ def bootstrap_principal_angles(
     device: str = "cpu",
     seed: int = 0,
 ) -> dict[str, StabilityStats]:
-    """Bootstrap the principal angles between top-k subspaces per layer.
+    """Bootstrap principal angles between top-k subspaces per layer.
 
-    Runs the capture+SVD pipeline `n_boot` times on independent random
-    subsets of `calib_dataset` (each of size `frac * len(dataset)`), then
-    computes pairwise principal angles between the retained subspaces.
+    Runs the capture+SVD pipeline ``n_boot`` times on independent
+    random subsets of ``calib_dataset`` (each of size
+    ``frac * len(dataset)``), then computes pairwise principal angles
+    between the retained subspaces.
 
-    Returns one `StabilityStats` per layer — the median/P90/max angle
-    across all C(n_boot, 2) pair comparisons and the number of pairs
-    that contributed.
+    Returns one :class:`StabilityStats` per layer, with the
+    median / P90 / max angle across all ``C(n_boot, 2)`` pair
+    comparisons and the number of contributing pairs.
     """
     if n_boot < 2:
-        raise ValueError(f"n_boot must be ≥ 2 to form pairs, got {n_boot}")
+        raise ValueError(f"n_boot must be >= 2 to form pairs, got {n_boot}")
     if not 0 < frac <= 1.0:
         raise ValueError(f"frac must be in (0, 1], got {frac}")
 
@@ -104,7 +103,7 @@ def bootstrap_principal_angles(
     rng = torch.Generator()
     rng.manual_seed(seed)
 
-    for boot in range(n_boot):
+    for _ in range(n_boot):
         indices = torch.randperm(N, generator=rng)[:subset_size].tolist()
         subset = Subset(calib_dataset, indices)
         loader = DataLoader(
@@ -131,9 +130,9 @@ def bootstrap_principal_angles(
             acc = accumulators[name]
             cov = acc.finalize()
             profile = svd.analyze(name, cov, source=activation_source)
-            # principal_components are the top-k eigenvectors; store the
-            # full (C, k) basis as a clone on CPU for later comparison.
-            per_layer_subspaces[name].append(profile.principal_components.detach().cpu().clone())
+            per_layer_subspaces[name].append(
+                profile.principal_components.detach().cpu().clone()
+            )
 
     out: dict[str, StabilityStats] = {}
     for name in layer_names:
@@ -144,12 +143,10 @@ def bootstrap_principal_angles(
                 angles_deg_all.append(_principal_angles(subspaces[a], subspaces[b]))
         if not angles_deg_all:
             continue
-        # All pair-angle vectors should have the same length (= min k);
-        # stack and flatten.
         min_k = min(v.shape[0] for v in angles_deg_all)
         if min_k == 0:
             continue
-        stacked = torch.stack([v[:min_k] for v in angles_deg_all])  # (n_pairs, k)
+        stacked = torch.stack([v[:min_k] for v in angles_deg_all])
         flat = stacked.flatten()
         out[name] = StabilityStats(
             name=name,
@@ -164,7 +161,7 @@ def bootstrap_principal_angles(
 
 
 def stability_stats_to_json(stats: dict[str, StabilityStats]) -> dict:
-    """Serialize stability stats for `json.dump`."""
+    """Serialize stability stats for :func:`json.dump`."""
     return {
         name: {
             "k": s.k,

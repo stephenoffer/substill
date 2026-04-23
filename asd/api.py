@@ -1,33 +1,30 @@
-"""Top-level Python library API for Activation Subspace Distillation.
+"""Top-level Python API for Activation Subspace Distillation.
 
-The goal is a minimal, composable surface that works on *any* PyTorch
-nn.Module. The three core pieces:
+The library surface is three core pieces::
 
-    profile(model, dataloader, layers=...)   → TeacherProfile
-    SubspaceLoss(profile, objective=...)     → nn.Module for your training loop
-    distill(teacher, student, dataloader)    → all-in-one trainer
+    profile(model, dataloader, layers=...)   -> TeacherProfile
+    SubspaceLoss(profile, objective=...)     -> nn.Module for your training loop
+    distill(teacher, student, dataloader)    -> all-in-one trainer
 
-For known architecture families (torchvision ResNets, HuggingFace GPT-2),
-layers can be auto-detected — just pass the model. For anything else,
-pass `layers=[module_a, module_b, ...]` or a list of dotted names.
+For known architecture families (torchvision ResNets, HuggingFace
+GPT-2), layers can be auto-detected: pass only the model. For
+anything else, pass ``layers=[module_a, module_b, ...]`` or a list of
+dotted names.
 
-## Quick start
+Example::
 
     import asd
     from torchvision.models import resnet50
-    from my_code import make_student
 
     teacher = resnet50(pretrained=True).eval()
 
-    # 1) profile the teacher once
     profile = asd.profile(
         teacher,
         calib_loader,
-        source="delta",     # 'output' | 'delta' | 'branch'
-        noise_model="mp",   # "eps" | "mp" — MP cutoff gives tighter rank estimates
+        source="delta",
+        noise_model="mp",
     )
 
-    # 2) add distillation loss to your existing training loop
     loss_fn = asd.SubspaceLoss(profile, objective="gram")
 
     for x, y in train_loader:
@@ -37,16 +34,15 @@ pass `layers=[module_a, module_b, ...]` or a list of dotted names.
         L = F.cross_entropy(s_logits, y) + loss_fn(s_hid, t_hid)
         L.backward()
 
-See `docs/quickstart.md` for a full walkthrough.
+See ``docs/quickstart.md`` for a full walkthrough.
 """
 
 from __future__ import annotations
 
-import contextlib
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 import torch.nn as nn
@@ -57,6 +53,7 @@ from torch.utils.data import DataLoader
 from .profiling.activation_capture import (
     ActivationCaptureEngine,
     VALID_SOURCES,
+    _residual_shortcut,
 )
 from .profiling.svd_analysis import (
     LayerProfile,
@@ -64,26 +61,24 @@ from .profiling.svd_analysis import (
     load_profiles,
     save_profiles,
 )
-from .models.student import SlimNet
 
-
-# ---------------------------------------------------------------------------
-# TeacherProfile — the first-class object returned by profile()
-# ---------------------------------------------------------------------------
 
 @dataclass
 class TeacherProfile:
     """Snapshot of a teacher's activation subspace across a set of layers.
 
-    Created by `asd.profile(...)`. Immutable from the user's POV — stash
-    it, save it, pass it to `SubspaceLoss` or `build_student`.
+    Created by :func:`profile`. Users should treat it as immutable:
+    stash it, save it, pass it to :class:`SubspaceLoss` or
+    :func:`build_student`.
 
     Attributes:
-        layers: the list of fully-qualified layer names that were hooked.
-        profiles: per-layer `LayerProfile` (principal components,
-            eigenvalues, effective rank, source tag, total channels).
-        source: `"output" | "delta" | "branch"`.
-        meta: free-form metadata (e.g. `{"noise_model": "mp", ...}`).
+        layers: Fully-qualified layer names that were hooked.
+        profiles: Per-layer :class:`LayerProfile` (principal
+            components, eigenvalues, effective rank, source tag,
+            total channels).
+        source: One of ``"output"``, ``"delta"``, ``"branch"``.
+        meta: Free-form metadata (for example,
+            ``{"noise_model": "mp", ...}``).
     """
 
     layers: list[str]
@@ -91,48 +86,45 @@ class TeacherProfile:
     source: str = "output"
     meta: dict[str, Any] = field(default_factory=dict)
 
-    # -------- convenience views ---------------------------------------------
-
     def effective_ranks(self) -> list[int]:
-        """Per-layer retained rank after noise/variance cutoff."""
+        """Return the retained rank per layer after noise cutoff."""
         return [p.effective_rank for p in self.profiles]
 
     def compression_ratios(self) -> list[float]:
-        """`effective_rank / total_channels` per layer — how much of the
-        teacher's representational width survived the subspace cut."""
+        """Return ``effective_rank / total_channels`` per layer."""
         return [p.effective_rank / p.total_channels for p in self.profiles]
 
     def groups_by_channels(self) -> dict[int, list[LayerProfile]]:
-        """Profiles grouped by their channel count — useful for ResNet-
-        style stage aggregation where multiple blocks share a width."""
+        """Group profiles by their channel count.
+
+        Useful for ResNet-style stage aggregation where multiple
+        blocks share a width.
+        """
         out: dict[int, list[LayerProfile]] = {}
         for p in self.profiles:
             out.setdefault(p.total_channels, []).append(p)
         return out
 
-    # -------- persistence ---------------------------------------------------
-
     def save(self, path: str | Path) -> None:
-        """Save to disk. Round-trips through `TeacherProfile.load`."""
+        """Save to disk. Round-trips through :meth:`load`."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         save_profiles(self.profiles, str(path))
         sidecar = path.with_suffix(path.suffix + ".meta.pt")
-        torch.save({
-            "layers": self.layers,
-            "source": self.source,
-            "meta": self.meta,
-        }, sidecar)
+        torch.save(
+            {"layers": self.layers, "source": self.source, "meta": self.meta},
+            sidecar,
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> "TeacherProfile":
+        """Load a profile saved by :meth:`save`."""
         path = Path(path)
         profiles = load_profiles(str(path))
         sidecar = path.with_suffix(path.suffix + ".meta.pt")
         if sidecar.exists():
             meta = torch.load(sidecar, weights_only=False)
         else:
-            # Old-style profile without sidecar — infer what we can.
             meta = {
                 "layers": [p.name for p in profiles],
                 "source": profiles[0].source if profiles else "output",
@@ -146,30 +138,30 @@ class TeacherProfile:
         )
 
 
-# ---------------------------------------------------------------------------
-# profile() — the first thing a user calls
-# ---------------------------------------------------------------------------
-
 def _resolve_layers(
     model: nn.Module,
     layers: Sequence[nn.Module] | Sequence[str] | None,
 ) -> list[str]:
     """Turn a user-supplied layer spec into a list of dotted module names.
 
-    - `None`: auto-detect for known architecture families. Raises if the
-      model isn't recognized.
-    - `list[nn.Module]`: look each one up in `model.named_modules()`.
-    - `list[str]`: take as-is after verifying the module exists.
+    ``None``: auto-detect for known architecture families. Raises if
+    the model is not recognized.
+
+    ``list[nn.Module]``: look each module up in
+    ``model.named_modules()``.
+
+    ``list[str]``: validate that each name exists.
     """
     if layers is None:
         from .autodetect import autodetect_layers
         return autodetect_layers(model)
     if len(layers) == 0:
-        raise ValueError("layers=[] is empty — pass None to auto-detect, "
-                         "or a non-empty list of modules / names.")
+        raise ValueError(
+            "layers=[] is empty. Pass None to auto-detect, or a "
+            "non-empty list of modules or names."
+        )
     first = layers[0]
     if isinstance(first, str):
-        # Validate each name resolves.
         name_to_mod = dict(model.named_modules())
         out: list[str] = []
         for n in layers:  # type: ignore[arg-type]
@@ -183,17 +175,18 @@ def _resolve_layers(
         for m in layers:  # type: ignore[arg-type]
             mid = id(m)
             if mid not in mod_to_name:
-                raise ValueError(f"module {type(m).__name__} is not a "
-                                 f"submodule of the given model")
+                raise ValueError(
+                    f"module {type(m).__name__} is not a submodule of the given model"
+                )
             out.append(mod_to_name[mid])
         return out
-    raise TypeError(f"layers must be list[nn.Module] or list[str], got "
-                    f"{type(layers).__name__}")
+    raise TypeError(
+        f"layers must be list[nn.Module] or list[str], got {type(layers).__name__}"
+    )
 
 
 def _model_device(model: nn.Module) -> str:
-    """Return the device of the first trainable parameter, or 'cpu' if
-    the model has no parameters."""
+    """Return the device of the first parameter or buffer, or ``"cpu"``."""
     for p in model.parameters():
         return str(p.device)
     for b in model.buffers():
@@ -220,59 +213,65 @@ def profile(
 ) -> TeacherProfile:
     """Profile a model's activations into a subspace-distillation profile.
 
-    Runs the model over `dataloader`, hooks the specified `layers`,
-    accumulates channel covariance, and eigendecomposes each to derive
-    top-k principal components and an effective rank.
+    Runs the model over ``dataloader``, hooks the specified
+    ``layers``, accumulates channel covariance, and eigendecomposes
+    each covariance to derive top-k principal components and an
+    effective rank.
 
     Args:
-        model: any PyTorch nn.Module. The model is set to `eval()` and
-            restored to its prior mode on return.
-        dataloader: yields `(x, _)` or just `x`. Only the first element
-            is passed to the model. Labels are ignored by default.
-        layers: which modules to hook. `None` auto-detects for known
-            families. Otherwise a list of modules or dotted names.
+        model: Any ``nn.Module``. Set to ``eval()`` during profiling
+            and restored to its prior mode on return.
+        dataloader: Yields ``(x, ...)`` tuples or just ``x``. Only
+            the first element is passed to the model.
+        layers: Which modules to hook. ``None`` auto-detects for
+            known families. Otherwise a list of modules or dotted
+            names.
         source:
-            `"output"` — hook module outputs. Default.
-            `"delta"` — residual updates `Δx = output − shortcut(input)`,
-                stripping the identity path. Typically gives tighter
-                effective rank than raw output on residual networks.
-            `"branch"` — hook branch sub-modules directly (e.g. a
-                transformer's `attn` / `mlp`). The caller is responsible
-                for passing the correct branch submodules in `layers`.
-        noise_model: `"eps"` (fixed relative floor at `eps_relative ·
-            λ_max`) or `"mp"` (Marchenko-Pastur / Gavish-Donoho bulk-
-            edge cutoff; requires `n_effective` ≥ number of channels).
-            MP typically produces an order-of-magnitude smaller rank
-            estimate than variance-threshold + eps on noisy-tail
-            spectra, with correspondingly tighter downstream compression.
-        shrinkage: `"none"` or `"ledoit_wolf"`. Applies linear shrinkage
-            to the covariance before eigendecomposition.
-        variance_threshold: for `rank_definition="variance"`, the
+            ``"output"``: hook module outputs (default).
+
+            ``"delta"``: the residual update
+            ``dx = output - shortcut(input)``, stripping the
+            identity path. Typically gives a tighter effective rank
+            than raw output on residual networks.
+
+            ``"branch"``: hook branch sub-modules directly (for
+            example a transformer's ``attn`` or ``mlp``). The caller
+            passes the correct branch submodules in ``layers``.
+        noise_model: ``"eps"`` (fixed relative floor at
+            ``eps_relative * lam_max``) or ``"mp"`` (Marchenko-Pastur
+            / Gavish-Donoho bulk-edge cutoff; requires
+            ``n_effective >= C``). MP typically produces an
+            order-of-magnitude smaller rank estimate than variance
+            threshold + eps on noisy-tail spectra.
+        shrinkage: ``"none"`` or ``"ledoit_wolf"``. Applies linear
+            shrinkage to the covariance before eigendecomposition.
+        variance_threshold: For ``rank_definition="variance"``, the
             cumulative-variance threshold defining effective rank.
-        n_effective: override the effective sample count for MP cutoff.
-            Required for MP to give a non-fallback threshold.
-        max_batches: optional cap on the number of dataloader batches.
-            Useful for fast profiling on large datasets.
-        device: where to run the model. `None` auto-selects cuda if
-            available.
+        n_effective: Override the effective sample count for MP
+            cutoff. Required for MP to produce a non-fallback
+            threshold.
+        max_batches: Optional cap on the number of dataloader
+            batches. Useful for fast profiling on large datasets.
+        device: Where to run the model. ``None`` keeps the model on
+            its current device.
 
     Returns:
-        `TeacherProfile` — immutable snapshot, ready to feed into
-        `SubspaceLoss` or `build_student`.
+        A :class:`TeacherProfile` snapshot ready to feed into
+        :class:`SubspaceLoss` or :func:`build_student`.
     """
     if source not in VALID_SOURCES:
         raise ValueError(f"source must be one of {VALID_SOURCES}; got {source!r}")
 
-    # Device management. Default: use whatever device the model is on.
-    # `device=None` preserves caller intent; explicit device overrides.
     original_device = _model_device(model)
     if device is None:
         device = original_device
 
     layer_names = _resolve_layers(model, layers)
     if not layer_names:
-        raise ValueError("No layers to hook. Pass `layers=` explicitly or "
-                         "use a model type autodetect supports.")
+        raise ValueError(
+            "No layers to hook. Pass `layers=` explicitly or use a "
+            "model type that autodetect supports."
+        )
 
     was_training = model.training
     model.eval()
@@ -287,8 +286,6 @@ def profile(
         source=source,
     )
 
-    # Run the capture. `dataloader` may yield `x` or `(x, y, ...)`.
-    # We unpack consistently.
     def _take_input(batch):
         if isinstance(batch, (list, tuple)):
             return batch[0]
@@ -309,7 +306,6 @@ def profile(
         if was_training:
             model.train()
 
-    # Analyze per-layer covariance with the configured noise/denoise pipeline.
     svd = SVDAnalyzer(
         variance_threshold=variance_threshold,
         definition=rank_definition,
@@ -320,10 +316,8 @@ def profile(
     )
     layer_profiles: list[LayerProfile] = []
     for name in layer_names:
-        acc = engine._accumulators.get(name)
+        acc = engine.accumulator(name)
         if acc is None:
-            # Layer never fired — usually means the auto-detected list
-            # includes a module that's never traversed during forward.
             warnings.warn(f"Layer {name!r} never fired; skipping.")
             continue
         cov = acc.finalize()
@@ -344,13 +338,11 @@ def profile(
     )
 
 
-# ---------------------------------------------------------------------------
-# capture() — context manager that grabs teacher hidden states on-the-fly
-# ---------------------------------------------------------------------------
-
 class _HiddenCapture:
-    """Returned from `asd.capture(model, profile)`. Acts as a dict-like
-    keyed by layer name after the forward pass exits."""
+    """Dict-like container returned by :func:`capture`.
+
+    Keyed by layer name after the wrapped forward pass exits.
+    """
 
     def __init__(self, model: nn.Module, profile: TeacherProfile):
         self.model = model
@@ -359,15 +351,10 @@ class _HiddenCapture:
         self._handles: list[Any] = []
 
     def __enter__(self) -> "_HiddenCapture":
-        # Build a name → module lookup once.
         name_to_mod = dict(self.model.named_modules())
         src = self.profile.source
         self._state.clear()
         self._handles = []
-
-        # For delta source we need input + shortcut(input) like the
-        # profiling engine does. Reuse that implementation.
-        from .profiling.activation_capture import _residual_shortcut
 
         for name in self.profile.layers:
             mod = name_to_mod[name]
@@ -381,13 +368,17 @@ class _HiddenCapture:
                         with torch.no_grad():
                             self._state[nm] = act - sc(x_in)
                     return hk
-                self._handles.append(mod.register_forward_hook(_make_hook(name, shortcut)))
+
+                self._handles.append(
+                    mod.register_forward_hook(_make_hook(name, shortcut))
+                )
             else:
                 def _make_hook(nm):
                     def hk(m, inputs, output):
                         act = output[0] if isinstance(output, tuple) else output
                         self._state[nm] = act
                     return hk
+
                 self._handles.append(mod.register_forward_hook(_make_hook(name)))
         return self
 
@@ -396,6 +387,9 @@ class _HiddenCapture:
             h.remove()
         self._handles.clear()
 
+    def __contains__(self, name: str) -> bool:
+        return name in self._state
+
     def __getitem__(self, name: str) -> Tensor:
         return self._state[name]
 
@@ -403,54 +397,55 @@ class _HiddenCapture:
         return len(self._state)
 
     def values(self) -> list[Tensor]:
-        """Return hidden states in the same order as `profile.layers`."""
+        """Return hidden states in the same order as ``profile.layers``."""
         return [self._state[n] for n in self.profile.layers]
 
 
 def capture(model: nn.Module, profile: TeacherProfile) -> _HiddenCapture:
-    """Context manager that hooks `model` and stashes hidden states at
-    every layer the `profile` knows about. Inside the `with`-block,
-    after the forward pass, access hidden states via
-    `capture_obj[layer_name]` or `capture_obj.values()`."""
+    """Context manager that hooks ``model`` at the profile's layers.
+
+    Inside the ``with`` block, after the forward pass, access hidden
+    states via ``capture_obj[layer_name]`` or ``capture_obj.values()``.
+    """
     return _HiddenCapture(model, profile)
 
 
-# ---------------------------------------------------------------------------
-# SubspaceLoss — basis-invariant feature-distillation loss, plug-and-play
-# ---------------------------------------------------------------------------
-
 class SubspaceLoss(nn.Module):
-    """Drop-in feature-distillation loss driven by a `TeacherProfile`.
+    """Feature-distillation loss driven by a :class:`TeacherProfile`.
 
-    Works on both image tensors (B, C, H, W) and transformer tensors
-    (B, T, C). Takes a list of student hidden tensors and a list of
-    teacher hidden tensors at matching layers; returns a scalar loss.
+    Accepts both image tensors ``(B, C, H, W)`` and transformer
+    tensors ``(B, T, C)``. Takes a list of student hidden tensors
+    and a list of teacher hidden tensors at matching layers, and
+    returns a scalar loss.
 
     Args:
-        profile: the `TeacherProfile` from `asd.profile(...)`.
-        objective: which loss to apply.
-            - `"coord_mse"`: MSE between student and teacher projections
-              in the specific eigenbasis. Basis-sensitive — fragile when
-              eigenvalues are close and the basis in the retained
-              subspace is not identifiable.
-            - `"gram"`: Frobenius distance between the kernel matrices
-              `K = Z Zᵀ`. Basis-invariant under rotations of V within
-              the retained subspace.
-            - `"cka"`: centered kernel alignment, `1 − <K_s,K_t>_F /
-              (‖K_s‖·‖K_t‖)`. Completely scale-invariant. Recommended
-              for LLMs where feature magnitudes are large.
-        power_weight_p: spectral weighting `w_i ∝ λ_i^(-p)`. `None`
-            (default) disables weighting.
-        normalize_features: L2-normalize student/teacher features
-            along the channel/feature axis before kernel computation.
-            Required for LLM stability; defaults to True.
-        student_widths: per-stage student widths. Optional — if None,
-            projectors are built lazily from the first forward pass's
-            tensor shapes. Supply explicitly when you want the
-            projectors created up-front (e.g. to add them to an
+        profile: The :class:`TeacherProfile` from :func:`profile`.
+        objective: Loss variant:
+
+            * ``"coord_mse"``: MSE between student and teacher
+              projections in the specific eigenbasis. Basis-
+              sensitive: fragile when eigenvalues are close and
+              the retained-subspace basis is not identifiable.
+            * ``"gram"``: Frobenius distance between the kernel
+              matrices ``K = Z Z^T``. Invariant under rotations of
+              ``V`` within the retained subspace.
+            * ``"cka"``: centered kernel alignment,
+              ``1 - <K_s, K_t>_F / (||K_s|| * ||K_t||)``. Fully
+              scale-invariant. Recommended for LLMs, where feature
+              magnitudes are large.
+        power_weight_p: Spectral weighting ``w_i ~ lam_i^{-p}``.
+            ``None`` (default) disables weighting.
+        normalize_features: L2-normalize student and teacher features
+            along the channel axis before kernel computation.
+            Required for LLM stability; defaults to ``True``.
+        student_widths: Per-stage student widths. Optional. If
+            ``None``, projectors are built lazily from the first
+            forward pass's tensor shapes. Supply explicitly to build
+            projectors up-front (for example, to add them to an
             optimizer before training starts).
 
-    Example:
+    Example::
+
         loss_fn = SubspaceLoss(profile, objective="cka")
         for x, y in loader:
             with asd.capture(teacher, profile) as t_hid:
@@ -483,21 +478,17 @@ class SubspaceLoss(nn.Module):
 
         for p in profile.profiles:
             k = p.effective_rank
-            C = p.total_channels
             comps = p.principal_components[:, :k].clone()
-            self.register_buffer(f"V_{len(self._per_layer_components)}", comps)
+            idx = len(self._per_layer_components)
+            self.register_buffer(f"V_{idx}", comps)
             self._per_layer_components.append(comps)
             w = _power_law_weights(p.eigenvalues, k, power_weight_p)
             if w is not None:
-                self.register_buffer(f"W_{len(self._per_layer_components)-1}", w)
+                self.register_buffer(f"W_{idx}", w)
             self._per_layer_weights.append(w)
             self._per_layer_k.append(k)
-            self._per_layer_c.append(C)
+            self._per_layer_c.append(p.total_channels)
 
-        # Student projectors: one per layer. Input width = student's
-        # hidden dim at that layer, output = k (teacher's retained rank).
-        # If `student_widths` is None we defer projector creation until
-        # the first forward call and infer from shapes.
         self._projectors: nn.ModuleList | None = None
         if student_widths is not None:
             self._build_projectors(list(student_widths))
@@ -516,11 +507,8 @@ class SubspaceLoss(nn.Module):
         self._projectors = nn.ModuleList(projs)
 
     def _project_student(self, idx: int, s_hid: Tensor) -> Tensor:
-        """Project student hidden to k-dim subspace. `s_hid` is either
-        (B, C, H, W) or (B, T, C)."""
         proj = self._projectors[idx]
         if s_hid.dim() == 4:
-            # (B, C, H, W) — apply linear as 1x1 conv over channels
             B, C, H, W = s_hid.shape
             flat = s_hid.permute(0, 2, 3, 1).reshape(-1, C)
             out = proj(flat)
@@ -530,31 +518,27 @@ class SubspaceLoss(nn.Module):
         raise ValueError(f"unsupported student hidden shape {s_hid.shape}")
 
     def _project_teacher(self, idx: int, t_hid: Tensor) -> Tensor:
-        V = getattr(self, f"V_{idx}")  # (C, k)
+        V = getattr(self, f"V_{idx}")
         if t_hid.dim() == 4:
             return torch.einsum("bchw,ck->bkhw", t_hid, V)
         if t_hid.dim() == 3:
             return t_hid @ V
         raise ValueError(f"unsupported teacher hidden shape {t_hid.shape}")
 
-    def _flatten(self, z: Tensor) -> Tensor:
-        """Flatten to (N, k) regardless of 3D or 4D input."""
+    @staticmethod
+    def _flatten(z: Tensor) -> Tensor:
         if z.dim() == 4:
             return z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])
         if z.dim() == 3:
             return z.reshape(-1, z.shape[-1])
         raise ValueError(f"unexpected shape {z.shape}")
 
-    def _layer_loss(
-        self, idx: int, s_hid: Tensor, t_hid: Tensor,
-    ) -> Tensor:
+    def _layer_loss(self, idx: int, s_hid: Tensor, t_hid: Tensor) -> Tensor:
         k = self._per_layer_k[idx]
         z_t = self._project_teacher(idx, t_hid)
         z_s = self._project_student(idx, s_hid)
 
         if self.normalize_features:
-            # Normalize over the channel axis per sample/position. Bounds
-            # entries in downstream kernels to [-1, 1].
             if z_t.dim() == 4:
                 z_t = F.normalize(z_t, p=2, dim=1, eps=1e-6)
                 z_s = F.normalize(z_s, p=2, dim=1, eps=1e-6)
@@ -565,17 +549,14 @@ class SubspaceLoss(nn.Module):
         w = getattr(self, f"W_{idx}", None)
 
         if self.objective == "coord_mse":
-            if z_t.dim() == 4:
-                diff_sq = (z_s - z_t) ** 2
-                if w is not None:
-                    diff_sq = diff_sq * w.view(1, -1, 1, 1)
-                return diff_sq.mean()
             diff_sq = (z_s - z_t) ** 2
             if w is not None:
-                diff_sq = diff_sq * w.view(1, 1, -1)
+                if z_t.dim() == 4:
+                    diff_sq = diff_sq * w.view(1, -1, 1, 1)
+                else:
+                    diff_sq = diff_sq * w.view(1, 1, -1)
             return diff_sq.mean()
 
-        # gram and cka both need flat (N, k) form.
         zt = self._flatten(z_t)
         zs = self._flatten(z_s)
         if w is not None:
@@ -599,8 +580,7 @@ class SubspaceLoss(nn.Module):
             cross = zs.T @ zt
             num = (cross ** 2).sum()
             den = ((g_s ** 2).sum() * (g_t ** 2).sum()).clamp(min=1e-12).sqrt()
-            cka = num / den
-            return 1.0 - cka
+            return 1.0 - num / den
 
         raise ValueError(f"unknown objective {self.objective!r}")
 
@@ -609,12 +589,16 @@ class SubspaceLoss(nn.Module):
         student_hiddens: Sequence[Tensor],
         teacher_hiddens: Sequence[Tensor],
     ) -> Tensor:
-        """Args:
-            student_hiddens: list of student tensors in the same order
-                as `profile.layers`. Each is (B, C, H, W) or (B, T, C).
-            teacher_hiddens: same, from the teacher.
+        """Compute the subspace loss.
+
+        Args:
+            student_hiddens: Student tensors in the same order as
+                ``profile.layers``. Each is ``(B, C, H, W)`` or
+                ``(B, T, C)``.
+            teacher_hiddens: Same shapes, from the teacher.
+
         Returns:
-            A scalar loss suitable for `.backward()`.
+            A scalar loss suitable for ``.backward()``.
         """
         if len(student_hiddens) != len(self._per_layer_k):
             raise ValueError(
@@ -627,7 +611,6 @@ class SubspaceLoss(nn.Module):
                 f"got {len(teacher_hiddens)}"
             )
         if self._projectors is None:
-            # Lazy-init projectors from student shapes.
             widths = []
             for s in student_hiddens:
                 if s.dim() == 4:
@@ -639,8 +622,11 @@ class SubspaceLoss(nn.Module):
             self._build_projectors(widths)
             self._projectors.to(student_hiddens[0].device)
 
-        total = torch.zeros((), device=student_hiddens[0].device,
-                            dtype=student_hiddens[0].dtype)
+        total = torch.zeros(
+            (),
+            device=student_hiddens[0].device,
+            dtype=student_hiddens[0].dtype,
+        )
         for idx, (s, t) in enumerate(zip(student_hiddens, teacher_hiddens)):
             total = total + self._layer_loss(idx, s, t)
         return total / max(len(student_hiddens), 1)
@@ -649,8 +635,10 @@ class SubspaceLoss(nn.Module):
 def _power_law_weights(
     eigenvalues: Tensor, k: int, power_p: float | None,
 ) -> Tensor | None:
-    """Compute per-component weights `w_i ∝ λ_i^(-p)`, normalized to
-    mean 1. Returns None when `power_p is None` (no weighting)."""
+    """Per-component weights ``w_i ~ lam_i^{-p}``, normalized to mean 1.
+
+    Returns ``None`` when ``power_p is None``.
+    """
     if power_p is None:
         return None
     sv = eigenvalues[:k].clone()
@@ -660,10 +648,6 @@ def _power_law_weights(
     return w / w.mean().clamp(min=1e-20)
 
 
-# ---------------------------------------------------------------------------
-# build_student() — optional helper for users who want the derived arch
-# ---------------------------------------------------------------------------
-
 def build_student(
     template: nn.Module | str,
     profile: TeacherProfile,
@@ -672,29 +656,28 @@ def build_student(
     arch_min: int | None = None,
     **kwargs,
 ) -> nn.Module:
-    """Build a student network with widths derived from the profile.
+    """Build a student network with widths derived from ``profile``.
 
-    `template` selects the student family:
-        - "slimnet" or a `SlimNet` class → 4-stage ResNet-style student.
-          Uses `profile.stage_widths(arch_multiplier)`.
-        - an existing `nn.Module` → the student family is guessed from
-          its type. For `torchvision.models.ResNet`, a SlimNet is built.
-          For HuggingFace `GPT2LMHeadModel`, a reduced-width GPT-2.
+    ``template`` selects the student family:
 
-    The specific builder for each family is in `asd.builders`. Users
-    with custom architectures should skip this helper and build their
-    own student — then feed its `.stage_widths()` (or per-layer hidden
-    sizes) into `SubspaceLoss(..., student_widths=...)`.
+    - ``"slimnet"`` or a :class:`SlimNet` class: 4-stage ResNet-style
+      student using ``profile.stage_widths(arch_multiplier)``.
+    - An existing ``nn.Module``: infers the family from its type. For
+      ``torchvision.models.ResNet`` a ``SlimNet`` is built. For
+      HuggingFace ``GPT2LMHeadModel`` a reduced-width GPT-2 is built.
+
+    For custom architectures, skip this helper. Build the student
+    directly, then feed its per-layer hidden widths to
+    ``SubspaceLoss(..., student_widths=...)``.
     """
     from . import builders
-    return builders.build(template, profile,
-                          arch_multiplier=arch_multiplier,
-                          arch_min=arch_min, **kwargs)
+    return builders.build(
+        template, profile,
+        arch_multiplier=arch_multiplier,
+        arch_min=arch_min,
+        **kwargs,
+    )
 
-
-# ---------------------------------------------------------------------------
-# distill() — one-call entry point for users who want the batteries
-# ---------------------------------------------------------------------------
 
 @dataclass
 class DistillResult:
@@ -719,20 +702,22 @@ def distill(
     objective: Literal["coord_mse", "gram", "cka"] = "gram",
     kd: bool = True,
     kd_temperature: float = 4.0,
-    alpha: float = 1.0,     # task weight
-    beta: float = 0.5,      # subspace weight
-    delta: float = 1.0,     # KD weight
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    delta: float = 1.0,
     device: str | None = None,
     **profile_kwargs,
 ) -> DistillResult:
-    """One-call distillation. Profiles the teacher if `profile` is None,
-    then trains the student with task + subspace + (optional) KD loss.
+    """One-call distillation.
 
-    `task_loss(logits, target)` is the per-batch task loss. Defaults to
-    `F.cross_entropy(logits, target)` for classification.
+    Profiles the teacher if ``profile`` is ``None``, then trains the
+    student with task + subspace + (optional) KD loss.
 
-    Returns a `DistillResult` with the trained student, the profile,
-    per-epoch history, and best-val metric.
+    ``task_loss(logits, target)`` is the per-batch task loss;
+    defaults to ``F.cross_entropy`` for classification.
+
+    Returns a :class:`DistillResult` with the trained student, the
+    profile, per-epoch history, and best-val metric.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -740,7 +725,6 @@ def distill(
     if profile is None:
         profile = globals()["profile"](teacher, train_loader, **profile_kwargs)
 
-    # Lightweight default task loss — classification CE.
     if task_loss is None:
         def task_loss(logits, target):
             return F.cross_entropy(logits, target)
@@ -750,10 +734,10 @@ def distill(
         p.requires_grad_(False)
     student = student.to(device)
 
-    # Infer student widths by running a forward pass with capture.
     widths = _infer_student_widths(student, profile, train_loader, device)
-    loss_fn = SubspaceLoss(profile, student_widths=widths,
-                           objective=objective).to(device)
+    loss_fn = SubspaceLoss(
+        profile, student_widths=widths, objective=objective,
+    ).to(device)
 
     opt = optimizer or torch.optim.SGD(
         list(student.parameters()) + list(loss_fn.parameters()),
@@ -767,8 +751,8 @@ def distill(
         running = {"task": 0.0, "sub": 0.0, "kd": 0.0, "total": 0.0, "n": 0}
         for batch in train_loader:
             if isinstance(batch, (list, tuple)):
-                x, target = batch[0].to(device), batch[1].to(device) \
-                    if len(batch) > 1 else None
+                x = batch[0].to(device)
+                target = batch[1].to(device) if len(batch) > 1 else None
             else:
                 x, target = batch.to(device), None
 
@@ -782,13 +766,12 @@ def distill(
                 s_out = student(x)
                 s_logits = _unpack_logits(s_out)
             s_hiddens = s_hid.values()
-            # capture() needs the same-named modules present on the
-            # student; if the student has fewer/different modules, we
-            # fall back to the output-level supervision only.
 
-            losses = {"task": torch.zeros((), device=device),
-                      "sub": torch.zeros((), device=device),
-                      "kd": torch.zeros((), device=device)}
+            losses = {
+                "task": torch.zeros((), device=device),
+                "sub": torch.zeros((), device=device),
+                "kd": torch.zeros((), device=device),
+            }
             if target is not None and s_logits is not None:
                 losses["task"] = task_loss(s_logits, target)
             if len(s_hiddens) == len(t_hiddens):
@@ -801,7 +784,11 @@ def distill(
                     reduction="batchmean",
                 ) * (T * T)
 
-            total = alpha * losses["task"] + beta * losses["sub"] + delta * losses["kd"]
+            total = (
+                alpha * losses["task"]
+                + beta * losses["sub"]
+                + delta * losses["kd"]
+            )
             opt.zero_grad()
             total.backward()
             opt.step()
@@ -829,8 +816,11 @@ def distill(
 
 
 def _unpack_logits(out) -> Tensor | None:
-    """Torchvision returns tensor; HF returns a dataclass with `.logits`;
-    our own models return a tuple `(logits, features)`."""
+    """Extract a logits tensor from a model output.
+
+    Handles torchvision tensors, HuggingFace dataclasses with
+    ``.logits``, and tuples like ``(logits, features)``.
+    """
     if out is None:
         return None
     if hasattr(out, "logits"):
@@ -843,11 +833,16 @@ def _unpack_logits(out) -> Tensor | None:
 
 
 def _infer_student_widths(
-    student: nn.Module, profile: TeacherProfile,
-    loader: DataLoader, device: str,
+    student: nn.Module,
+    profile: TeacherProfile,
+    loader: DataLoader,
+    device: str,
 ) -> list[int]:
-    """One mini-batch forward under a capture to record student hidden
-    shapes at the profile layers. Returns widths in profile order."""
+    """Run one forward pass under ``capture`` to record student hidden widths.
+
+    Returns widths in profile order. Returns an empty list when the
+    student does not share the profile's layer names.
+    """
     batch = next(iter(loader))
     x = batch[0] if isinstance(batch, (list, tuple)) else batch
     x = x.to(device)
@@ -856,11 +851,7 @@ def _infer_student_widths(
             student(x)
     widths: list[int] = []
     for n in profile.layers:
-        if n not in cap._state:
-            # The student doesn't share this layer name — this is
-            # expected and the caller needs to handle it. For the high-
-            # level distill() we fall back to skipping subspace losses
-            # by returning an empty widths list.
+        if n not in cap:
             return []
         h = cap[n]
         widths.append(h.shape[1] if h.dim() == 4 else h.shape[-1])
@@ -869,7 +860,9 @@ def _infer_student_widths(
 
 @torch.no_grad()
 def _evaluate(
-    model: nn.Module, loader: DataLoader, device: str,
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
     task_loss: Callable,
 ) -> dict[str, float]:
     model.eval()
