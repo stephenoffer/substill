@@ -40,4 +40,4 @@ Documentation = "https://github.com/anthropics/neural-distill#readme"
 Source = "https://github.com/anthropics/neural-distill"
 
 [tool.setuptools.packages.find]
-include = ["asd*"]
+include = ["asd*", "fasd*"]
