@@ -33,6 +33,6 @@ def test_correct_teacher_reduces_loss():
     assert stats["final_loss"] <= stats["initial_loss"] + 1e-3
     # Teacher weights changed in place.
     changed = any(
-        not torch.equal(b, a) for b, a in zip(before_params, model.parameters())
+        not torch.equal(b, a) for b, a in zip(before_params, model.parameters(), strict=False)
     )
     assert changed

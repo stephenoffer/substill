@@ -32,49 +32,10 @@ from torch import Tensor
 from .compression.absorbed_init import absorbed_linear_init
 from .compression.width_pruner import StudentConfig, profile_to_student_config
 
-
 Template = Literal["gpt2", "llama", "auto"]
 
 
 # -- helpers -----------------------------------------------------------
-
-
-def _pad_or_trunc_rows(T: Tensor, new_rows: int) -> Tensor:
-    """Resize ``T`` along dim 0 to ``new_rows``."""
-    old = T.shape[0]
-    if old == new_rows:
-        return T.clone()
-    if old < new_rows:
-        pad_shape = list(T.shape)
-        pad_shape[0] = new_rows - old
-        pad = torch.zeros(pad_shape, dtype=T.dtype, device=T.device)
-        return torch.cat([T, pad], dim=0)
-    return T[:new_rows].contiguous()
-
-
-def _orthonormalize_columns(V: Tensor) -> Tensor:
-    """QR-orthonormalize columns of V, zeroing any linearly dependent ones.
-
-    Ensures absorbed-init weights (V_out^T W V_in) have bounded norm even
-    when the inputs came from truncated/padded eigenbases that may not be
-    exactly column-orthonormal.
-    """
-    if V.numel() == 0:
-        return V
-    # Identify zero columns so QR doesn't produce NaNs.
-    col_norms = V.norm(dim=0)
-    nonzero = col_norms > 1e-8
-    if not bool(nonzero.any()):
-        return V
-    Q = torch.zeros_like(V)
-    if nonzero.all():
-        q, _ = torch.linalg.qr(V)
-        return q
-    sub = V[:, nonzero]
-    q, _ = torch.linalg.qr(sub)
-    idx = torch.nonzero(nonzero, as_tuple=False).squeeze(-1)
-    Q[:, idx] = q
-    return Q
 
 
 def _residual_basis(profile, t_hidden: int, s_hidden: int) -> Tensor:
@@ -112,14 +73,10 @@ def _residual_basis(profile, t_hidden: int, s_hidden: int) -> Tensor:
             continue
         V = b.principal_components.float()
         eigvals = getattr(b, "eigenvalues", None)
-        if eigvals is None:
-            # No eigenvalues stored — degrade to a uniformly-weighted
-            # diag estimate (||V[i,:]||^2). This is a degenerate signal
-            # for fully-orthogonal V, so we also keep the PC matrix as
-            # a tie-breaker fallback below.
-            eigvals = torch.ones(V.shape[1], dtype=V.dtype)
-        else:
-            eigvals = eigvals.float()
+        # No eigenvalues stored — degrade to a uniformly-weighted diag estimate
+        # (||V[i,:]||^2). This is a degenerate signal for fully-orthogonal V, so
+        # we also keep the PC matrix as a tie-breaker fallback below.
+        eigvals = torch.ones(V.shape[1], dtype=V.dtype) if eigvals is None else eigvals.float()
         # cov = V diag(eigvals) V^T  ⇒  cov.diag()[i] = sum_j V[i,j]^2 eigvals[j]
         cov_diag = (V * V * eigvals.unsqueeze(0)).sum(dim=1)
         cov_diag_sum = cov_diag if cov_diag_sum is None else cov_diag_sum + cov_diag
@@ -163,10 +120,7 @@ def _channel_select_basis(profile, branch_name: str, k: int) -> Tensor:
                 return torch.eye(n)
             V = b.principal_components.float()
             eigvals = getattr(b, "eigenvalues", None)
-            if eigvals is None:
-                eigvals = torch.ones(V.shape[1], dtype=V.dtype)
-            else:
-                eigvals = eigvals.float()
+            eigvals = torch.ones(V.shape[1], dtype=V.dtype) if eigvals is None else eigvals.float()
             cov_diag = (V * V * eigvals.unsqueeze(0)).sum(dim=1)
             if (cov_diag.max() - cov_diag.min()).item() < 1e-6:
                 # Degenerate scoring — fall back to first-k columns of PC
@@ -178,19 +132,6 @@ def _channel_select_basis(profile, branch_name: str, k: int) -> Tensor:
                 E[i, j] = 1.0
             return E
     raise KeyError(f"branch {branch_name!r} not in profile")
-
-
-def _find_branch_basis(profile, module_path: str, rank_override: int | None = None) -> Tensor | None:
-    """Return the principal-components slice ``V[:, :k]`` for a branch."""
-    for b in profile.branches:
-        if getattr(b, "module_path", None) == module_path:
-            k = rank_override if rank_override is not None else int(b.behavioral_rank)
-            return b.principal_components[:, :k].contiguous().float()
-    for b in profile.branches:
-        if b.name.startswith(module_path):
-            k = rank_override if rank_override is not None else int(b.behavioral_rank)
-            return b.principal_components[:, :k].contiguous().float()
-    return None
 
 
 def _pad_cols_orthogonal(V: Tensor, cols_needed: int) -> Tensor:
@@ -236,19 +177,19 @@ def _build_gpt2(teacher, profile, student_cfg: StudentConfig, absorbed_init: boo
         ) from e
 
     t_cfg = teacher.config
-    s_cfg_kwargs = dict(
-        vocab_size=int(getattr(t_cfg, "vocab_size")),
-        n_positions=int(getattr(t_cfg, "n_positions", 1024)),
-        n_embd=int(student_cfg.hidden_size),
-        n_layer=int(student_cfg.num_hidden_layers),
-        n_head=int(student_cfg.num_attention_heads),
-        n_inner=int(student_cfg.intermediate_size),
-        activation_function=getattr(t_cfg, "activation_function", "gelu_new"),
-        resid_pdrop=float(getattr(t_cfg, "resid_pdrop", 0.1)),
-        embd_pdrop=float(getattr(t_cfg, "embd_pdrop", 0.1)),
-        attn_pdrop=float(getattr(t_cfg, "attn_pdrop", 0.1)),
-        layer_norm_epsilon=float(getattr(t_cfg, "layer_norm_epsilon", 1e-5)),
-    )
+    s_cfg_kwargs = {
+        "vocab_size": int(t_cfg.vocab_size),
+        "n_positions": int(getattr(t_cfg, "n_positions", 1024)),
+        "n_embd": int(student_cfg.hidden_size),
+        "n_layer": int(student_cfg.num_hidden_layers),
+        "n_head": int(student_cfg.num_attention_heads),
+        "n_inner": int(student_cfg.intermediate_size),
+        "activation_function": getattr(t_cfg, "activation_function", "gelu_new"),
+        "resid_pdrop": float(getattr(t_cfg, "resid_pdrop", 0.1)),
+        "embd_pdrop": float(getattr(t_cfg, "embd_pdrop", 0.1)),
+        "attn_pdrop": float(getattr(t_cfg, "attn_pdrop", 0.1)),
+        "layer_norm_epsilon": float(getattr(t_cfg, "layer_norm_epsilon", 1e-5)),
+    }
     s_config = GPT2Config(**s_cfg_kwargs)
     student = GPT2LMHeadModel(s_config)
 
@@ -268,8 +209,7 @@ def _gpt2_pad_rows(V: Tensor, rows: int) -> Tensor:
 
 
 def gpt2_absorb_targets(teacher, student, profile):
-    """Yield ``(name, t_module, s_module, V_in, V_out)`` for every absorbed
-    weight in a GPT-2 student.
+    """Yield ``(name, t_module, s_module, V_in, V_out)`` for every absorbed weight.
 
     Used both by initial absorption (:func:`_gpt2_absorb`) and by periodic
     re-absorption (:mod:`fasd.training.reabsorb`). The bases are derived
@@ -300,7 +240,10 @@ def gpt2_absorb_targets(teacher, student, profile):
             _channel_select_basis(profile, f"{prefix}.ffn.up", s_interm), t_interm
         )
         yield (f"{prefix}.attn.c_attn", t_block.attn.c_attn, s_block.attn.c_attn, V_r_full, V_qkv)
-        yield (f"{prefix}.attn.c_proj", t_block.attn.c_proj, s_block.attn.c_proj, V_r_full, V_r_full)
+        yield (
+            f"{prefix}.attn.c_proj", t_block.attn.c_proj, s_block.attn.c_proj,
+            V_r_full, V_r_full,
+        )
         yield (f"{prefix}.mlp.c_fc", t_block.mlp.c_fc, s_block.mlp.c_fc, V_r_full, V_up)
         yield (f"{prefix}.mlp.c_proj", t_block.mlp.c_proj, s_block.mlp.c_proj, V_up, V_r_full)
 
@@ -405,7 +348,7 @@ def _build_llama(teacher, profile, student_cfg: StudentConfig, absorbed_init: bo
 
     t_cfg = teacher.config
     s_cfg = LlamaConfig(
-        vocab_size=int(getattr(t_cfg, "vocab_size")),
+        vocab_size=int(t_cfg.vocab_size),
         max_position_embeddings=int(getattr(t_cfg, "max_position_embeddings", 2048)),
         hidden_size=int(student_cfg.hidden_size),
         intermediate_size=int(student_cfg.intermediate_size),
@@ -448,7 +391,7 @@ def _build_llama(teacher, profile, student_cfg: StudentConfig, absorbed_init: bo
         t_block = t_layers[i]
         prefix = f"model.layers.{i}"
 
-        V_q = _col_basis(profile, f"{prefix}.attn.q", s_hidden)
+        _col_basis(profile, f"{prefix}.attn.q", s_hidden)
         V_k = _col_basis(profile, f"{prefix}.attn.k", s_kv_out)
         V_v = _col_basis(profile, f"{prefix}.attn.v", s_kv_out)
         # v10: channel-select for FFN intermediate. SiLU is element-wise so
@@ -466,12 +409,12 @@ def _build_llama(teacher, profile, student_cfg: StudentConfig, absorbed_init: bo
             pad = torch.zeros(rows - V.shape[0], V.shape[1], dtype=V.dtype)
             return torch.cat([V, pad], dim=0)
 
+        kv_rows = int(
+            getattr(t_cfg, "num_key_value_heads", t_cfg.num_attention_heads)
+        ) * (t_hidden_int // int(t_cfg.num_attention_heads))
         V_r_full = _pad_rows(V_r, t_hidden_int)
-        V_q_full = _pad_rows(V_q, t_hidden_int)
-        V_k_full = _pad_rows(V_k, int(getattr(t_cfg, "num_key_value_heads", t_cfg.num_attention_heads))
-                             * (t_hidden_int // int(t_cfg.num_attention_heads)))
-        V_v_full = _pad_rows(V_v, int(getattr(t_cfg, "num_key_value_heads", t_cfg.num_attention_heads))
-                             * (t_hidden_int // int(t_cfg.num_attention_heads)))
+        V_k_full = _pad_rows(V_k, kv_rows)
+        V_v_full = _pad_rows(V_v, kv_rows)
         V_up_full = _pad_rows(V_up, t_interm_int)
 
         # Mirror the GPT-2 fix: for non-GQA, q/k/v share V_r_full so Q·K^T is
@@ -479,17 +422,19 @@ def _build_llama(teacher, profile, student_cfg: StudentConfig, absorbed_init: bo
         # has a smaller k/v output dim; until we derive a kv-shared sub-basis,
         # GQA still uses the legacy per-branch V_k/V_v (latent disjoint-basis bug).
         is_gqa = s_kv_out != s_hidden
-        absorbed_linear_init(t_block.self_attn.q_proj, s_block.self_attn.q_proj, V_in=V_r_full, V_out=V_r_full)
+        attn, s_attn = t_block.self_attn, s_block.self_attn
+        absorbed_linear_init(attn.q_proj, s_attn.q_proj, V_in=V_r_full, V_out=V_r_full)
         if is_gqa:
-            absorbed_linear_init(t_block.self_attn.k_proj, s_block.self_attn.k_proj, V_in=V_r_full, V_out=V_k_full)
-            absorbed_linear_init(t_block.self_attn.v_proj, s_block.self_attn.v_proj, V_in=V_r_full, V_out=V_v_full)
+            absorbed_linear_init(attn.k_proj, s_attn.k_proj, V_in=V_r_full, V_out=V_k_full)
+            absorbed_linear_init(attn.v_proj, s_attn.v_proj, V_in=V_r_full, V_out=V_v_full)
         else:
-            absorbed_linear_init(t_block.self_attn.k_proj, s_block.self_attn.k_proj, V_in=V_r_full, V_out=V_r_full)
-            absorbed_linear_init(t_block.self_attn.v_proj, s_block.self_attn.v_proj, V_in=V_r_full, V_out=V_r_full)
-        absorbed_linear_init(t_block.self_attn.o_proj, s_block.self_attn.o_proj, V_in=V_r_full, V_out=V_r_full)
-        absorbed_linear_init(t_block.mlp.gate_proj, s_block.mlp.gate_proj, V_in=V_r_full, V_out=V_gate)
-        absorbed_linear_init(t_block.mlp.up_proj, s_block.mlp.up_proj, V_in=V_r_full, V_out=V_up_full)
-        absorbed_linear_init(t_block.mlp.down_proj, s_block.mlp.down_proj, V_in=V_up_full, V_out=V_r_full)
+            absorbed_linear_init(attn.k_proj, s_attn.k_proj, V_in=V_r_full, V_out=V_r_full)
+            absorbed_linear_init(attn.v_proj, s_attn.v_proj, V_in=V_r_full, V_out=V_r_full)
+        absorbed_linear_init(attn.o_proj, s_attn.o_proj, V_in=V_r_full, V_out=V_r_full)
+        mlp, s_mlp = t_block.mlp, s_block.mlp
+        absorbed_linear_init(mlp.gate_proj, s_mlp.gate_proj, V_in=V_r_full, V_out=V_gate)
+        absorbed_linear_init(mlp.up_proj, s_mlp.up_proj, V_in=V_r_full, V_out=V_up_full)
+        absorbed_linear_init(mlp.down_proj, s_mlp.down_proj, V_in=V_up_full, V_out=V_r_full)
 
         # RMSNorm scale is a diagonal, project it.
         _copy_rmsnorm(t_block.input_layernorm, s_block.input_layernorm, V_r)
@@ -508,6 +453,55 @@ def _build_llama(teacher, profile, student_cfg: StudentConfig, absorbed_init: bo
         )
 
     return student
+
+
+def llama_absorb_targets(teacher, student, profile):
+    """Yield ``(name, t_module, s_module, V_in, V_out)`` for every absorbed weight.
+
+    Recomputes the same bases ``_build_llama`` used for a Llama-family student.
+    Mirror of :func:`gpt2_absorb_targets` for the Llama path — lets the CPSD
+    manifold-training conversion recover each linear's ``(V_in, V_out)`` to wrap it
+    as a Stiefel-trainable :class:`TeacherFactoredLinear`. Layout is ``"linear"``.
+    """
+    t_cfg, s_cfg = teacher.config, student.config
+    t_hidden = int(t_cfg.hidden_size)
+    s_hidden = int(s_cfg.hidden_size)
+    s_interm = int(s_cfg.intermediate_size)
+    head_dim = s_hidden // int(s_cfg.num_attention_heads)
+    s_kv_out = int(s_cfg.num_key_value_heads) * head_dim
+    t_interm = int(getattr(t_cfg, "intermediate_size", 4 * t_hidden))
+    t_kv = int(getattr(t_cfg, "num_key_value_heads", t_cfg.num_attention_heads)) \
+        * (t_hidden // int(t_cfg.num_attention_heads))
+
+    V_r = _residual_basis(profile, t_hidden, s_hidden)
+
+    def _pad_rows(V, rows):
+        if V.shape[0] == rows:
+            return V
+        if V.shape[0] > rows:
+            return V[:rows]
+        return torch.cat([V, torch.zeros(rows - V.shape[0], V.shape[1], dtype=V.dtype)], dim=0)
+
+    V_r_full = _pad_rows(V_r, t_hidden)
+    is_gqa = s_kv_out != s_hidden
+    t_layers, s_layers = teacher.model.layers, student.model.layers
+    for i, s_block in enumerate(s_layers):
+        t_block = t_layers[i]
+        prefix = f"model.layers.{i}"
+        V_k = _pad_rows(_col_basis(profile, f"{prefix}.attn.k", s_kv_out), t_kv)
+        V_v = _pad_rows(_col_basis(profile, f"{prefix}.attn.v", s_kv_out), t_kv)
+        V_gate = _channel_select_basis(profile, f"{prefix}.ffn.gate", s_interm)
+        V_up = _pad_rows(_channel_select_basis(profile, f"{prefix}.ffn.up", s_interm), t_interm)
+        kv_out = (V_k, V_v) if is_gqa else (V_r_full, V_r_full)
+        attn, s_attn = t_block.self_attn, s_block.self_attn
+        mlp, s_mlp = t_block.mlp, s_block.mlp
+        yield (f"{prefix}.self_attn.q_proj", attn.q_proj, s_attn.q_proj, V_r_full, V_r_full)
+        yield (f"{prefix}.self_attn.k_proj", attn.k_proj, s_attn.k_proj, V_r_full, kv_out[0])
+        yield (f"{prefix}.self_attn.v_proj", attn.v_proj, s_attn.v_proj, V_r_full, kv_out[1])
+        yield (f"{prefix}.self_attn.o_proj", attn.o_proj, s_attn.o_proj, V_r_full, V_r_full)
+        yield (f"{prefix}.mlp.gate_proj", mlp.gate_proj, s_mlp.gate_proj, V_r_full, V_gate)
+        yield (f"{prefix}.mlp.up_proj", mlp.up_proj, s_mlp.up_proj, V_r_full, V_up)
+        yield (f"{prefix}.mlp.down_proj", mlp.down_proj, s_mlp.down_proj, V_up, V_r_full)
 
 
 @torch.no_grad()
@@ -532,8 +526,15 @@ def build_student(
     template: Template = "auto",
     depth_policy: str = "keep",
     depth_keep: int | None = None,
+    rank_map: dict[str, int] | None = None,
 ):
-    """Construct a compressed student from a teacher profile."""
+    """Construct a compressed student from a teacher profile.
+
+    ``rank_map`` (optional): per-branch rank dict produced by
+    :func:`fasd.compression.rank_allocator.allocate_ranks`. When provided,
+    overrides each branch's stored ``behavioral_rank`` and disables
+    ``arch_multiplier`` scaling — the rank-map already encodes the budget.
+    """
     if template == "auto":
         cls_name = type(teacher).__name__
         if "GPT2" in cls_name:
@@ -551,6 +552,7 @@ def build_student(
         arch_multiplier=arch_multiplier,
         depth_policy=depth_policy,
         depth_keep=depth_keep,
+        rank_map=rank_map,
     )
     if template == "gpt2":
         return _build_gpt2(teacher, profile, cfg, absorbed_init)

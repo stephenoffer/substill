@@ -22,6 +22,7 @@ Rungs:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -34,12 +35,10 @@ from datetime import datetime, timezone
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import fasd  # noqa: E402
-
 
 RUNG_ORDER = [
     "r0_random",
@@ -89,10 +88,8 @@ def _atomic_write(path: str, data: str) -> None:
                 check=True,
             )
         finally:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(local)
-            except FileNotFoundError:
-                pass
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # Per-pid tmp name so concurrent writers on shared storage don't collide.
@@ -148,10 +145,8 @@ def _remove_if_exists_any(path: str) -> None:
         # rm is idempotent for S3 (no error if missing).
         subprocess.run(["aws", "s3", "rm", "--quiet", path], check=False)
         return
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.remove(path)
-    except FileNotFoundError:
-        pass
 
 
 def _write_json(path: str, data: dict) -> None:
@@ -263,84 +258,89 @@ def _update_progress_md(output_dir: str, tag: str) -> None:
 # the CLI, applied to all rungs). The rung config knobs below are purely
 # *algorithmic* — what the student does given a fixed param budget.
 RUNG_CONFIGS = {
-    "r0_random": dict(
-        use_behavioral=True,
-        objective="gram",
-        generative_kd="forward_kl",
-        absorbed_init=False,
-        on_policy_start=2.0,
-        quantize=False,
-        reabsorb_every_steps=0,
-    ),
-    "r1_static": dict(
-        use_behavioral=True,
-        objective="schedule",
-        generative_kd="skew_kl",
-        absorbed_init=True,
-        on_policy_start=2.0,
-        quantize=False,
-        reabsorb_every_steps=0,
-    ),
-    "r2_pra200": dict(
-        use_behavioral=True,
-        objective="schedule",
-        generative_kd="skew_kl",
-        absorbed_init=True,
-        on_policy_start=2.0,
-        quantize=False,
-        reabsorb_every_steps=200,
-    ),
-    "r3_pra100": dict(
-        use_behavioral=True,
-        objective="schedule",
-        generative_kd="skew_kl",
-        absorbed_init=True,
-        on_policy_start=2.0,
-        quantize=False,
-        reabsorb_every_steps=100,
-    ),
-    "r4_pra200_onpolicy": dict(
-        use_behavioral=True,
-        objective="schedule",
-        generative_kd="skew_kl",
-        absorbed_init=True,
-        on_policy_start=0.5,
-        quantize=False,
-        reabsorb_every_steps=200,
-    ),
+    "r0_random": {
+        "use_behavioral": True,
+        "objective": "gram",
+        "generative_kd": "forward_kl",
+        "absorbed_init": False,
+        "on_policy_start": 2.0,
+        "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "r1_static": {
+        "use_behavioral": True,
+        "objective": "schedule",
+        "generative_kd": "skew_kl",
+        "absorbed_init": True,
+        "on_policy_start": 2.0,
+        "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "r2_pra200": {
+        "use_behavioral": True,
+        "objective": "schedule",
+        "generative_kd": "skew_kl",
+        "absorbed_init": True,
+        "on_policy_start": 2.0,
+        "quantize": False,
+        "reabsorb_every_steps": 200,
+    },
+    "r3_pra100": {
+        "use_behavioral": True,
+        "objective": "schedule",
+        "generative_kd": "skew_kl",
+        "absorbed_init": True,
+        "on_policy_start": 2.0,
+        "quantize": False,
+        "reabsorb_every_steps": 100,
+    },
+    "r4_pra200_onpolicy": {
+        "use_behavioral": True,
+        "objective": "schedule",
+        "generative_kd": "skew_kl",
+        "absorbed_init": True,
+        "on_policy_start": 0.5,
+        "quantize": False,
+        "reabsorb_every_steps": 200,
+    },
     # v10 rungs retained for backward-compat re-runs of old tags.
-    "0_baseline": dict(
-        use_behavioral=False, objective="gram", generative_kd="forward_kl",
-        absorbed_init=False, on_policy_start=2.0, quantize=False, reabsorb_every_steps=0,
-    ),
-    "1_behavioral": dict(
-        use_behavioral=True, objective="gram", generative_kd="forward_kl",
-        absorbed_init=False, on_policy_start=2.0, quantize=False, reabsorb_every_steps=0,
-    ),
-    "2_procrustes": dict(
-        use_behavioral=True, objective="schedule", generative_kd="forward_kl",
-        absorbed_init=False, on_policy_start=2.0, quantize=False, reabsorb_every_steps=0,
-    ),
-    "3_skewkl": dict(
-        use_behavioral=True, objective="schedule", generative_kd="skew_kl",
-        absorbed_init=False, on_policy_start=2.0, quantize=False, reabsorb_every_steps=0,
-    ),
-    "4_absorbed": dict(
-        use_behavioral=True, objective="schedule", generative_kd="skew_kl",
-        absorbed_init=True, on_policy_start=2.0, quantize=False, reabsorb_every_steps=0,
-    ),
-    "5_onpolicy": dict(
-        use_behavioral=True, objective="schedule", generative_kd="skew_kl",
-        absorbed_init=True, on_policy_start=0.5, quantize=False, reabsorb_every_steps=0,
-    ),
-    "6_quantize": dict(
-        use_behavioral=True, objective="schedule", generative_kd="skew_kl",
-        absorbed_init=True, on_policy_start=2.0, quantize=True, reabsorb_every_steps=0,
-    ),
-    "7_full": dict(
-        use_behavioral=True, objective="schedule", generative_kd="skew_kl",
-        absorbed_init=True, on_policy_start=0.5, quantize=True, reabsorb_every_steps=0,
-    ),
+    "0_baseline": {
+        "use_behavioral": False, "objective": "gram", "generative_kd": "forward_kl",
+        "absorbed_init": False, "on_policy_start": 2.0, "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "1_behavioral": {
+        "use_behavioral": True, "objective": "gram", "generative_kd": "forward_kl",
+        "absorbed_init": False, "on_policy_start": 2.0, "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "2_procrustes": {
+        "use_behavioral": True, "objective": "schedule", "generative_kd": "forward_kl",
+        "absorbed_init": False, "on_policy_start": 2.0, "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "3_skewkl": {
+        "use_behavioral": True, "objective": "schedule", "generative_kd": "skew_kl",
+        "absorbed_init": False, "on_policy_start": 2.0, "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "4_absorbed": {
+        "use_behavioral": True, "objective": "schedule", "generative_kd": "skew_kl",
+        "absorbed_init": True, "on_policy_start": 2.0, "quantize": False,
+        "reabsorb_every_steps": 0,
+    },
+    "5_onpolicy": {
+        "use_behavioral": True, "objective": "schedule", "generative_kd": "skew_kl",
+        "absorbed_init": True, "on_policy_start": 0.5, "quantize": False, "reabsorb_every_steps": 0,
+    },
+    "6_quantize": {
+        "use_behavioral": True, "objective": "schedule", "generative_kd": "skew_kl",
+        "absorbed_init": True, "on_policy_start": 2.0, "quantize": True, "reabsorb_every_steps": 0,
+    },
+    "7_full": {
+        "use_behavioral": True, "objective": "schedule", "generative_kd": "skew_kl",
+        "absorbed_init": True, "on_policy_start": 0.5, "quantize": True, "reabsorb_every_steps": 0,
+    },
 }
 
 
@@ -615,7 +615,12 @@ def _run_rung(args, config, result_path: str) -> None:
 
     teacher_params = sum(p.numel() for p in teacher.parameters())
     student_params = sum(p.numel() for p in student.parameters())
-    print(f"[fasd-ablation] teacher_params={teacher_params/1e6:.1f}M  student_params={student_params/1e6:.1f}M  cmp={teacher_params/student_params:.2f}x", flush=True)
+    print(
+        f"[fasd-ablation] teacher_params={teacher_params/1e6:.1f}M  "
+        f"student_params={student_params/1e6:.1f}M  "
+        f"cmp={teacher_params/student_params:.2f}x",
+        flush=True,
+    )
 
     _stage("eval_initial_student_ppl", stage_t)
     initial_student_ppl = _eval_ppl(student, loaders["val"], args.device)
@@ -643,11 +648,6 @@ def _run_rung(args, config, result_path: str) -> None:
         rollout_prompts = first_batch["input_ids"][:, :16].to(args.device)
 
     t0 = time.time()
-    loss_fn = fasd.F_ASDLoss(
-        profile,
-        objective=loss_objective,
-        schedule=schedule,
-    ).to(args.device)
 
     # Resolve PRA frequency: CLI override (>0) wins over rung default.
     pra_steps = int(args.reabsorb_every_steps) or int(config.get("reabsorb_every_steps") or 0)
@@ -672,7 +672,8 @@ def _run_rung(args, config, result_path: str) -> None:
         reabsorb_every_steps=pra_steps if pra_steps > 0 else None,
     )
     train_time = time.time() - t0
-    final_ppl = result.best_metric
+    final_ppl = result.final_metric if result.final_metric is not None else result.best_metric
+    best_ppl = result.best_metric
 
     summary = {
         "rung": args.rung,
@@ -692,6 +693,7 @@ def _run_rung(args, config, result_path: str) -> None:
         "teacher_ppl": teacher_ppl,
         "initial_student_ppl": initial_student_ppl,
         "final_student_ppl": final_ppl,
+        "best_student_ppl": best_ppl,
         "val_kl_forward": result.val_kl_forward,
         "val_kl_reverse": result.val_kl_reverse,
         "total_steps": args.total_steps,

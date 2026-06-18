@@ -1,5 +1,7 @@
-"""Periodic Re-Absorption (PRA) — re-derive teacher PCA bases mid-training
-and re-project the student onto them while preserving the learned residual.
+"""Periodic Re-Absorption (PRA) — re-derive teacher PCA bases mid-training.
+
+Re-project the student onto the refreshed bases while preserving the learned
+residual.
 
 Why this exists
 ---------------
@@ -51,8 +53,8 @@ values.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import replace
-from typing import Iterable
 
 import torch
 import torch.nn as nn
@@ -61,7 +63,7 @@ from torch import Tensor
 from ..api import BranchProfile, TeacherProfile
 from ..autodetect import BranchSpec
 from ..builders import gpt2_absorb_targets, gpt2_residual_basis
-from ..compression.absorbed_init import absorbed_weight, absorbed_bias, _infer_layout
+from ..compression.absorbed_init import _infer_layout, absorbed_bias, absorbed_weight
 from ..profiling.activation_capture import BranchCaptureEngine
 
 
@@ -73,10 +75,10 @@ def recompute_principal_components(
     *,
     device: str | torch.device | None = None,
 ) -> TeacherProfile:
-    """Run PCA on a fresh calibration batch, return a new profile with
-    refreshed ``principal_components`` and ``eigenvalues`` but the SAME
-    ``behavioral_rank`` per branch as the input profile.
+    """Run PCA on a fresh calibration batch and return a new profile.
 
+    The new profile has refreshed ``principal_components`` and ``eigenvalues``
+    but the SAME ``behavioral_rank`` per branch as the input profile.
     Architecture-affecting fields (rank, channels, slice, kind, name) are
     preserved so re-absorption can re-use the same student layout.
     """
@@ -150,22 +152,12 @@ def _rotate_1d(b: Tensor, R_out: Tensor) -> Tensor:
     return R_out @ b
 
 
-def _reset_optim_state_for(optimizer, params: list[torch.nn.Parameter]) -> None:
-    """Zero the Adam state for the given params (m and v both reset)."""
-    if optimizer is None:
-        return
-    for p in params:
-        if p in optimizer.state:
-            optimizer.state[p] = {}
-
-
 def _rotate_optim_state_for(
     optimizer,
     p: torch.nn.Parameter,
     R_out: Tensor,
     R_in: Tensor | None,
     layout: str,
-    rotate_v: bool = False,
 ) -> None:
     """Reset Adam state for a re-projected parameter.
 
@@ -241,7 +233,7 @@ def reabsorb_gpt2(
     # Per-weight rotation.
     for (name_o, t_mod, s_mod, V_in_old, V_out_old), (
         name_n, _t2, _s2, V_in_new, V_out_new,
-    ) in zip(old_targets, new_targets):
+    ) in zip(old_targets, new_targets, strict=False):
         assert name_o == name_n, f"target order mismatch: {name_o} vs {name_n}"
         layout = _infer_layout(s_mod)
 
@@ -312,19 +304,12 @@ def reabsorb_gpt2(
         (wpe_init_new + d_wpe @ R_r_e.T).to(wpe.dtype).to(wpe.device)
     )
 
-    # Optimizer state for embeddings: m has shape (vocab, s_h). Right-multiply
-    # by R_r.T to rotate output dim only.
-    if optimizer is not None:
-        for p in (wte, wpe):
-            state = optimizer.state.get(p)
-            if not state:
-                continue
-            m = state.get("exp_avg")
-            if m is not None and m.dim() == 2:
-                state["exp_avg"] = (m @ R_r.to(m).T).contiguous()
-            v = state.get("exp_avg_sq")
-            if v is not None:
-                state["exp_avg_sq"] = torch.zeros_like(v)
+    # Embeddings: zero m, zero v, reset step — same policy as the linear path
+    # (_rotate_optim_state_for). The previous rotate-m + zero-v + no-step-reset
+    # variant produced m/eps updates of ~10^8x effective LR after a re-absorb,
+    # which is the failure mode r2_pra200 hit in v11 (PPL ~1e18).
+    for p in (wte, wpe):
+        _rotate_optim_state_for(optimizer, p, R_r, None, "linear")
 
     return profile_new
 

@@ -31,7 +31,6 @@ from torch import Tensor
 
 from asd.profiling.activation_capture import CovarianceAccumulator
 
-
 Backend = Literal["exact", "randomized", "oja"]
 
 
@@ -154,7 +153,6 @@ class StreamingPCA:
             Y = self._Y / float(self._n_samples)  # ~ C @ Omega
             for _ in range(self.power_iter):
                 Q, _ = torch.linalg.qr(Y)
-                Z = self._omega.T @ Q  # not used further, keep structure symmetric
                 Y = Y @ (Q.T @ Y)  # C @ (Q Q^T) @ Omega ~ power-iterated sketch
             Q, _ = torch.linalg.qr(Y)
             # Project and solve small eigenproblem: B = Q^T C Q is approximated

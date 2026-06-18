@@ -22,7 +22,7 @@ def _synthetic_batches(C=32, N=4096, k=8, batch=256, seed=0):
     Q, _ = torch.linalg.qr(torch.randn(C, C, generator=g))
     # Give the first k directions strong variance; rest near zero.
     eig = torch.cat([torch.linspace(10.0, 2.0, k), 0.01 * torch.ones(C - k)])
-    for start in range(0, N, batch):
+    for _start in range(0, N, batch):
         x = torch.randn(batch, C, generator=g) * eig.sqrt()
         yield x @ Q.T
     # keep Q accessible for comparison
@@ -76,6 +76,6 @@ def test_streaming_pca_oja_runs_and_produces_orthonormal_basis():
     basis, _ = oja.top_k()
     assert basis.shape == (C, k)
     # Semi-orthogonality: basis^T basis should be close to I.
-    I = torch.eye(k)
-    err = (basis.T @ basis - I).abs().max().item()
+    eye = torch.eye(k)
+    err = (basis.T @ basis - eye).abs().max().item()
     assert err < 1e-3, f"oja output should be orthonormal, got max err {err}"

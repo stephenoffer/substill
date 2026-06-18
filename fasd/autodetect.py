@@ -18,11 +18,11 @@ old :mod:`asd` call sites).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 import torch.nn as nn
-
 
 BranchKind = Literal[
     "attn.q",

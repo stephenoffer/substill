@@ -14,8 +14,7 @@ its output is split into Q/K/V slices for three separate accumulators.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Callable
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -196,7 +195,7 @@ class BranchHiddenCapture:
         for b in self.branches:
             self._by_module.setdefault(b.module_path, []).append(b)
 
-    def __enter__(self) -> "BranchHiddenCapture":
+    def __enter__(self) -> BranchHiddenCapture:
         self._state.clear()
         for module_path, specs in self._by_module.items():
             module = _get_module(self.model, module_path)

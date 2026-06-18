@@ -19,7 +19,6 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-
 Method = Literal["uniform", "entropy", "disagreement", "completion"]
 
 

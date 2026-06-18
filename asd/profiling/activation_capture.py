@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
 
 VALID_SOURCES = ("output", "delta", "branch")
 
@@ -166,12 +165,12 @@ def _residual_shortcut(module: nn.Module) -> Callable[[Tensor], Tensor]:
       (true for standard transformer blocks).
     """
     if hasattr(module, "downsample"):
-        ds = getattr(module, "downsample")
+        ds = module.downsample
         if ds is None:
             return lambda x: x
         return ds
     if hasattr(module, "shortcut"):
-        return getattr(module, "shortcut")
+        return module.shortcut
     return lambda x: x
 
 
@@ -227,10 +226,7 @@ class ActivationCaptureEngine:
         parts = name.split(".")
         mod = self.model
         for part in parts:
-            if part.isdigit():
-                mod = mod[int(part)]
-            else:
-                mod = getattr(mod, part)
+            mod = mod[int(part)] if part.isdigit() else getattr(mod, part)
         return mod
 
     def _make_hook(self, name: str):
@@ -249,10 +245,7 @@ class ActivationCaptureEngine:
                 act = output
 
             if name not in self._initialized:
-                if act.dim() == 4:
-                    num_channels = act.shape[1]
-                else:
-                    num_channels = act.shape[-1]
+                num_channels = act.shape[1] if act.dim() == 4 else act.shape[-1]
                 self._accumulators[name] = CovarianceAccumulator(
                     num_channels,
                     device=self.accumulator_device,
@@ -323,8 +316,10 @@ def get_resnet_stage_layer_names(backbone: str = "resnet50") -> dict[str, list[s
 
 
 def get_resnet50_layer_names() -> list[str]:
+    """Return the capture layer names for ResNet-50."""
     return get_resnet_layer_names("resnet50")
 
 
 def get_resnet50_stage_layer_names() -> dict[str, list[str]]:
+    """Return the per-stage capture layer names for ResNet-50."""
     return get_resnet_stage_layer_names("resnet50")

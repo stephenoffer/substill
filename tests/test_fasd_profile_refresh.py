@@ -55,7 +55,7 @@ def test_refresh_from_profile_updates_basis_when_rank_stable():
     # Projector preserved (same rank, no reallocation).
     assert id(loss_fn.projectors["a"]) == proj_id_before
     # Basis buffer changed.
-    V_buf = loss_fn._get_V("a")
+    V_buf = loss_fn._get_v("a")
     assert torch.allclose(V_buf, Q[:, :4].float(), atol=1e-6)
 
 

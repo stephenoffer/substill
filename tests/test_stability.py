@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 
 from asd.profiling.stability import (
-    bootstrap_principal_angles,
     _principal_angles,
+    bootstrap_principal_angles,
 )
 
 

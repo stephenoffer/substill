@@ -9,7 +9,6 @@ from fasd.profiling.token_weighting import (
     compute_weights,
     disagreement_weights,
     entropy_weights,
-    uniform_weights,
 )
 
 

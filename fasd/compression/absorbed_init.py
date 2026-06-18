@@ -32,7 +32,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-
 WeightLayout = Literal["linear", "conv1d_gpt2"]
 
 
@@ -90,6 +89,7 @@ def absorbed_bias(
     b_teacher: Tensor | None,
     V_out: Tensor | None,
 ) -> Tensor | None:
+    """Project a teacher bias into the absorbed output basis ``V_out``."""
     if b_teacher is None:
         return None
     if V_out is None:
@@ -131,7 +131,7 @@ def absorbed_linear_init(
         V_out = V_out.to(device=W_t.device, dtype=W_t.dtype)
 
     W_s = absorbed_weight(W_t, V_in, V_out, layout=layout_t)
-    b_s = absorbed_bias(b_t, V_out) if layout_t == "linear" else absorbed_bias(b_t, V_out)
+    b_s = absorbed_bias(b_t, V_out)
 
     # Copy onto student in-place (cross-device safe).
     if W_s.shape != student_module.weight.shape:

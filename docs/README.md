@@ -1,33 +1,29 @@
-# ASD documentation
+# neural_distill documentation
 
-The [top-level README](../README.md) has the pitch and the API
-overview. This directory has the technical docs.
+`fasd` is the library; `asd` is an internal subpackage of profiling
+utilities it builds on (not a public API). The
+[top-level README](../README.md) has the pitch and the public-API
+overview. This directory holds the technical docs.
 
-| file                           | what it is                                |
-|--------------------------------|-------------------------------------------|
-| [quickstart.md](quickstart.md) | Two-minute library walkthrough            |
-| [algorithm.md](algorithm.md)   | Mechanism, math, design rationale         |
+## fasd
 
-## One-paragraph description
+| file                                               | what it is                                            |
+|----------------------------------------------------|-------------------------------------------------------|
+| [cpsd.md](cpsd.md)                                 | CPSD (Circuit-Preserving Subspace Distillation) — the novel system behind `FSDPipeline` |
+| [adding_architectures.md](adding_architectures.md) | Checklist for supporting a new model family via `ArchitectureSpec` |
+| [fasd/quickstart.md](fasd/quickstart.md)           | F-ASD library walkthrough                             |
+| [fasd/algorithm.md](fasd/algorithm.md)             | F-ASD mechanism & math                                |
 
-`asd.profile(teacher, calib_loader)` runs a calibration batch through
-the teacher with forward hooks, accumulates channel covariance at
-each block, eigendecomposes, and keeps the top-`k` principal
-directions per block (with a Marchenko-Pastur bulk-edge cutoff to
-reject noise-bulk eigenvalues). `asd.SubspaceLoss(profile)` is an
-`nn.Module` loss that projects student hidden states into the
-teacher's retained subspace and matches them with centered kernel
-alignment (scale-invariant, best for LLMs), Gram-Frobenius
-(basis-invariant, good for CNNs), or coordinate MSE. The student
-plus the loss's per-layer linear projections train jointly in
-whatever training loop you already have.
+## Project status & history
 
-## Read this file if you want to:
+| file                     | what it is                                          |
+|--------------------------|-----------------------------------------------------|
+| [report.md](report.md)   | Integration milestone snapshot                      |
+| [handoff.md](handoff.md) | Sprint-by-sprint build status + next-phase plan     |
+| [archive/](archive/)     | Older status snapshots (historical)                 |
 
-- Use the library on your own model: [quickstart.md](quickstart.md).
-- Understand the method: [algorithm.md](algorithm.md).
-- Skim the code: [`asd/api.py`](../asd/api.py). Single file, heavily
-  commented.
-- Reproduce the benchmarks in the top-level README:
-  [`scripts/finetune_teacher.py`](../scripts/finetune_teacher.py) and
-  [`scripts/distill_cifar_resnet.py`](../scripts/distill_cifar_resnet.py).
+## Skim the code
+
+- Public API: [`fasd/__init__.py`](../fasd/__init__.py) and
+  [`fasd/pipeline.py`](../fasd/pipeline.py) (`FSDPipeline`).
+- Internal profiling utilities: [`asd/profiling/`](../asd/profiling/).

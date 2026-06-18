@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -47,6 +48,8 @@ def main():
     p.add_argument("tag")
     p.add_argument("--base", default=os.environ.get("ANYSCALE_ARTIFACT_STORAGE", ""))
     p.add_argument("--markdown", action="store_true")
+    p.add_argument("--csv", default=None,
+                   help="Optional path to write a flat CSV summary (one row per result).")
     args = p.parse_args()
 
     base = args.base.rstrip("/")
@@ -59,13 +62,15 @@ def main():
 
     if is_s3:
         names = _list_s3_keys(results_dir)
-        loader = lambda n: _read_s3(f"{results_dir}{n}")
+        def loader(n):
+            return _read_s3(f"{results_dir}{n}")
     else:
         if not os.path.isdir(results_dir):
             print(f"no results dir at {results_dir}", file=sys.stderr)
             sys.exit(1)
         names = [n for n in sorted(os.listdir(results_dir)) if n.endswith(".json")]
-        loader = lambda n: _read_local(os.path.join(results_dir, n))
+        def loader(n):
+            return _read_local(os.path.join(results_dir, n))
 
     if not names:
         print(f"no result JSONs at {results_dir}", file=sys.stderr)
@@ -92,10 +97,13 @@ def main():
         rs = groups[comp_key]
         print(f"## Target compression: {comp_key}")
         print()
-        print("| Rung | Final PPL | Teacher PPL | Actual cmp | Init PPL | KL fwd | KL rev | Train (s) | PRA every |")
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print(
+            "| Rung | Final PPL | Best PPL | Teacher PPL | Actual cmp | "
+            "Init PPL | KL fwd | KL rev | Train (s) | PRA every |"
+        )
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for r in sorted(rs, key=lambda x: x.get("rung", "")):
-            def fmt(k, spec=".2f", d="—"):
+            def fmt(k, spec=".2f", d="—", r=r):
                 v = r.get(k)
                 try:
                     return format(v, spec)
@@ -105,6 +113,7 @@ def main():
             print(
                 f"| {r.get('rung','?'):<22s} | "
                 f"{fmt('final_student_ppl')} | "
+                f"{fmt('best_student_ppl')} | "
                 f"{fmt('teacher_ppl')} | "
                 f"{fmt('compression_ratio', '.2f')}x | "
                 f"{fmt('initial_student_ppl', '.2e')} | "
@@ -114,6 +123,22 @@ def main():
                 f"{pra if pra else '—':>3} |"
             )
         print()
+
+    if args.csv:
+        fields = [
+            "tag", "rung", "target_compression", "compression_ratio",
+            "student_params_M", "teacher_params_M",
+            "final_student_ppl", "best_student_ppl", "teacher_ppl",
+            "initial_student_ppl", "val_kl_forward", "val_kl_reverse",
+            "reabsorb_every_steps", "total_steps", "train_time_s",
+        ]
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for rs in groups.values():
+                for r in sorted(rs, key=lambda x: x.get("rung", "")):
+                    w.writerow({k: r.get(k) for k in fields})
+        print(f"# csv: {args.csv}", file=sys.stderr)
 
 
 if __name__ == "__main__":

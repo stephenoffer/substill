@@ -17,15 +17,17 @@ v0.1 implements all stages; see the plan file for scope.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable, Literal
+import math
+from collections.abc import Iterable
+from typing import Literal
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
-from ..api import DistillResult, TeacherProfile, capture, profile as profile_fn
+from ..api import DistillResult, TeacherProfile, capture
+from ..api import profile as profile_fn
 from ..autodetect import BranchSpec
 from ..compression.quantization import qad_finetune, quantize_student
 from ..compression.width_pruner import StudentConfig, plan_progressive_stages
@@ -36,10 +38,9 @@ from ..losses.generative_kd import (
     skew_kl,
 )
 from ..losses.subspace import F_ASDLoss, Schedule, default_schedule
-from .onpolicy import HybridCollator, ReplayBuffer, RolloutBatch, generate_rollouts
+from .onpolicy import ReplayBuffer, RolloutBatch, generate_rollouts
 from .reabsorb import reabsorb_gpt2
 from .teacher_correction import correct_teacher
-
 
 KD = Literal["forward_kl", "reverse_kl", "skew_kl"]
 
@@ -78,24 +79,6 @@ def _move_batch(batch, device):
     if isinstance(batch, Tensor):
         return batch.to(device)
     return batch
-
-
-def _logits_labels_mask(batch, out, device):
-    logits = _logits(out)
-    if isinstance(batch, dict):
-        labels = batch.get("labels", batch.get("input_ids"))
-        attn = batch.get("attention_mask")
-    elif isinstance(batch, Tensor):
-        labels = batch
-        attn = None
-    else:
-        labels = batch[0] if isinstance(batch, (tuple, list)) and len(batch) > 0 else None
-        attn = None
-    mask = None
-    if attn is not None:
-        # Shifted mask for next-token prediction.
-        mask = attn[..., 1:].to(logits.dtype)
-    return logits, labels, mask
 
 
 def _shift_ce(logits: Tensor, labels: Tensor, ignore_index: int = -100) -> Tensor:
@@ -144,7 +127,6 @@ def distill(
     beta: float = 0.5,
     delta: float = 1.0,
     temperature: float = 2.0,
-    profile_refresh: int | None = None,
     teacher_correction_steps: int = 0,
     on_policy_start: float = 0.5,
     on_policy_ratio: float = 0.5,
@@ -195,12 +177,17 @@ def distill(
 
     # 1. Progressive planning -------------------------------------
     if progressive_stages > 1 and hasattr(student, "config"):
+        cfg = student.config
+
+        def _cfg(primary, fallback, default=0):
+            return int(getattr(cfg, primary, getattr(cfg, fallback, default)))
+
         target = StudentConfig(
-            hidden_size=int(getattr(student.config, "hidden_size", getattr(student.config, "n_embd", 0))),
-            intermediate_size=int(getattr(student.config, "intermediate_size", getattr(student.config, "n_inner", 0))),
-            num_attention_heads=int(getattr(student.config, "num_attention_heads", getattr(student.config, "n_head", 1))),
-            num_key_value_heads=int(getattr(student.config, "num_key_value_heads", getattr(student.config, "n_head", 1))),
-            num_hidden_layers=int(getattr(student.config, "num_hidden_layers", getattr(student.config, "n_layer", 1))),
+            hidden_size=_cfg("hidden_size", "n_embd"),
+            intermediate_size=_cfg("intermediate_size", "n_inner"),
+            num_attention_heads=_cfg("num_attention_heads", "n_head", 1),
+            num_key_value_heads=_cfg("num_key_value_heads", "n_head", 1),
+            num_hidden_layers=_cfg("num_hidden_layers", "n_layer", 1),
         )
         stages = plan_progressive_stages(teacher.config, target, n_stages=progressive_stages)
         history.append({"stage": "progressive_plan", "num_stages": len(stages)})
@@ -237,10 +224,26 @@ def distill(
         instability_weights=_instability_weights(profile) if instability_downweight else None,
     ).to(device)
 
-    if optimizer is None:
+    own_optimizer = optimizer is None
+    if own_optimizer:
         params = [p for p in student.parameters() if p.requires_grad]
         params += [p for p in loss_fn.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=lr)
+
+    # Warmup-50 + cosine decay. Doubles as a soft re-warmup after PRA events,
+    # which arrive mid-training when state["step"] is reset for rotated params.
+    # Skip if caller provided their own optimizer — they manage their own LR.
+    scheduler = None
+    if own_optimizer:
+        warmup_steps = min(50, max(1, total_steps // 20))
+
+        def _lr_lambda(s: int) -> float:
+            if s < warmup_steps:
+                return float(s + 1) / float(warmup_steps)
+            progress = (s - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     # Replay buffer for on-policy stage.
     replay = ReplayBuffer(capacity=max(64, on_policy_batch_size * 16))
@@ -250,6 +253,9 @@ def distill(
     step = 0
     folded = False
     refreshed = False
+    consecutive_nan_trips = 0
+    best_metric: float | None = None
+    eval_every = max(50, total_steps // 20)
 
     loader_iter = iter(train_loader)
     while step < total_steps:
@@ -258,10 +264,13 @@ def distill(
         # Pick batch source based on stage.
         on_policy_active = frac >= on_policy_start and rollout_prompts is not None
         draw_on = False
-        if on_policy_active and len(replay) >= on_policy_batch_size:
-            # With probability on_policy_ratio draw from replay; otherwise off-policy.
-            if torch.rand(1).item() < on_policy_ratio:
-                draw_on = True
+        # With probability on_policy_ratio draw from replay; otherwise off-policy.
+        if (
+            on_policy_active
+            and len(replay) >= on_policy_batch_size
+            and torch.rand(1).item() < on_policy_ratio
+        ):
+            draw_on = True
 
         if draw_on:
             batch = _rollout_to_batch(replay.sample(on_policy_batch_size))
@@ -278,10 +287,8 @@ def distill(
         batch = _move_batch(batch, device)
 
         # Forward passes: student with grad, teacher frozen.
-        teacher_kwargs = batch if isinstance(batch, dict) else None
-        with capture(teacher, profile, detach=True) as t_hiddens:
-            with torch.no_grad():
-                t_out = teacher(**batch) if isinstance(batch, dict) else teacher(batch)
+        with capture(teacher, profile, detach=True) as t_hiddens, torch.no_grad():
+            t_out = teacher(**batch) if isinstance(batch, dict) else teacher(batch)
         t_logits = _logits(t_out)
 
         with capture(student, profile) as s_hiddens:
@@ -355,10 +362,32 @@ def distill(
             except Exception:
                 contr_loss = torch.zeros((), device=device)
 
-        total = alpha * task_loss + beta * sub_loss + delta * kd_loss + contrastive_weight * contr_loss
+        total = (
+            alpha * task_loss + beta * sub_loss
+            + delta * kd_loss + contrastive_weight * contr_loss
+        )
 
-        # NaN / Inf guard: skip the step rather than poisoning the student.
+        # NaN / Inf guard: halve LR on first trip; abort the rung on a second
+        # consecutive trip rather than continuing to spin at a degenerate state.
         if not torch.isfinite(total):
+            consecutive_nan_trips += 1
+            if consecutive_nan_trips >= 2:
+                history.append(
+                    {
+                        "step": step,
+                        "frac": frac,
+                        "source": source,
+                        "stage": "nan_abort",
+                        "consecutive_trips": consecutive_nan_trips,
+                    }
+                )
+                print(
+                    f"[fasd.distill] nan_abort step={step} after 2 consecutive nonfinite losses",
+                    flush=True,
+                )
+                break
+            for pg in optimizer.param_groups:
+                pg["lr"] = max(pg["lr"] * 0.5, 1e-7)
             history.append(
                 {
                     "step": step,
@@ -368,12 +397,14 @@ def distill(
                     "task_loss": float(task_loss.detach().item()),
                     "sub_loss": float(sub_loss.detach().item()),
                     "kd_loss": float(kd_loss.detach().item()),
+                    "lr_after": float(optimizer.param_groups[0]["lr"]),
                 }
             )
             optimizer.zero_grad()
             step += 1
             continue
 
+        consecutive_nan_trips = 0
         optimizer.zero_grad()
         total.backward()
         if grad_clip is not None and grad_clip > 0.0:
@@ -383,6 +414,8 @@ def distill(
                 grad_clip,
             )
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         history.append(
             {
@@ -419,7 +452,9 @@ def distill(
 
         # Profile refresh at on-policy transition.
         if not refreshed and frac >= on_policy_start and rollout_prompts is not None:
-            _maybe_generate_and_push(student, rollout_prompts, replay, generation_max_new_tokens, device)
+            _maybe_generate_and_push(
+                student, rollout_prompts, replay, generation_max_new_tokens, device
+            )
             # Run a light profile refresh on the freshly-generated sequences.
             if len(replay) >= on_policy_batch_size:
                 refresh_batch = replay.sample(on_policy_batch_size)
@@ -489,6 +524,14 @@ def distill(
                 history.append({"stage": "reabsorb_failed", "step": step, "error": str(e)})
                 print(f"[fasd.distill] reabsorb failed at step {step}: {e}", flush=True)
 
+        if val_loader is not None and step > 0 and step % eval_every == 0:
+            ppl = _eval_ppl(student, val_loader, device)
+            if math.isfinite(ppl) and (best_metric is None or ppl < best_metric):
+                best_metric = ppl
+            history.append(
+                {"stage": "periodic_eval", "step": step, "val_ppl": ppl, "best_ppl": best_metric}
+            )
+
         step += 1
 
     # Quantization-aware final stage.
@@ -503,12 +546,14 @@ def distill(
             )
             history.append({"stage": "qad_finetune", **qad})
 
-    best_metric = None
     teacher_metric = None
     val_kl_forward: float | None = None
     val_kl_reverse: float | None = None
+    final_metric: float | None = None
     if val_loader is not None:
-        best_metric = _eval_ppl(student, val_loader, device)
+        final_metric = _eval_ppl(student, val_loader, device)
+        if math.isfinite(final_metric) and (best_metric is None or final_metric < best_metric):
+            best_metric = final_metric
         teacher_metric = _eval_ppl(teacher, val_loader, device)
         val_kl_forward = _eval_kl(teacher, student, val_loader, device, direction="forward")
         val_kl_reverse = _eval_kl(teacher, student, val_loader, device, direction="reverse")
@@ -518,6 +563,7 @@ def distill(
         profile=profile,
         history=history,
         best_metric=best_metric,
+        final_metric=final_metric,
         teacher_metric=teacher_metric,
         val_kl_forward=val_kl_forward,
         val_kl_reverse=val_kl_reverse,
@@ -583,21 +629,20 @@ def _instability_weights(profile: TeacherProfile) -> dict[str, float]:
 def _build_feature_cache(teacher, profile, loader, device) -> dict[str, list[Tensor]]:
     cache: dict[str, list[Tensor]] = {b.name: [] for b in profile.branches}
     teacher.eval()
-    with torch.no_grad():
-        with capture(teacher, profile, detach=True) as hiddens:
-            for batch in loader:
-                b = _move_batch(batch, device)
-                if isinstance(b, dict):
-                    teacher(**b)
-                elif isinstance(b, Tensor):
-                    teacher(b)
-                else:
-                    teacher(*b)
-                for bp in profile.branches:
-                    if bp.name in hiddens:
-                        V = bp.principal_components[:, : int(bp.behavioral_rank)].to(device).float()
-                        z = hiddens[bp.name].to(device) @ V
-                        cache[bp.name].append(z.detach().cpu())
+    with torch.no_grad(), capture(teacher, profile, detach=True) as hiddens:
+        for batch in loader:
+            b = _move_batch(batch, device)
+            if isinstance(b, dict):
+                teacher(**b)
+            elif isinstance(b, Tensor):
+                teacher(b)
+            else:
+                teacher(*b)
+            for bp in profile.branches:
+                if bp.name in hiddens:
+                    V = bp.principal_components[:, : int(bp.behavioral_rank)].to(device).float()
+                    z = hiddens[bp.name].to(device) @ V
+                    cache[bp.name].append(z.detach().cpu())
     return cache
 
 

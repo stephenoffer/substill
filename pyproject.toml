@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "neural-distill"
 version = "0.2.0"
-description = "Activation Subspace Distillation — drop-in feature KD for PyTorch models, CNNs and LLMs"
+description = "Functionally-aligned activation-subspace distillation (F-ASD / CPSD) for compressing LLMs"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "ASD contributors" }]
@@ -23,17 +23,16 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0",
-    "torchvision>=0.15",
     "omegaconf>=2.3",
     "tqdm",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-timeout"]
+dev = ["pytest>=7.0", "pytest-timeout", "ruff>=0.6"]
 viz = ["matplotlib>=3.7", "tensorboard"]
 llm = ["transformers>=4.30", "datasets>=2.0"]
-all = ["pytest>=7.0", "pytest-timeout", "matplotlib>=3.7", "tensorboard",
-       "transformers>=4.30", "datasets>=2.0"]
+all = ["pytest>=7.0", "pytest-timeout", "ruff>=0.6", "matplotlib>=3.7",
+       "tensorboard", "transformers>=4.30", "datasets>=2.0"]
 
 [project.urls]
 Documentation = "https://github.com/anthropics/neural-distill#readme"
@@ -41,3 +40,37 @@ Source = "https://github.com/anthropics/neural-distill"
 
 [tool.setuptools.packages.find]
 include = ["asd*", "fasd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+# runs/ holds throwaway de-risk prototypes and experiment outputs (gitignored).
+extend-exclude = ["runs"]
+
+[tool.ruff.lint]
+# Strict selection: pyflakes, pycodestyle, isort, pyupgrade, bugbear,
+# comprehensions, pep8-naming, flake8-simplify, pydocstyle.
+select = ["E", "W", "F", "I", "UP", "B", "C4", "N", "SIM", "D"]
+# Carve-outs for the research reality of this codebase:
+#   N801 — class names: keeps the public `F_ASDLoss` without an API-breaking rename.
+#   N803/N806 — argument/variable names: math notation (V_in, V_out, W_T, Q, K) is
+#               intentional and matches the papers; renaming would obscure the math.
+#   N812/N814 — import aliases: the `import torch.nn.functional as F` idiom and friends.
+#   D102/D105/D107 — undocumented method/dunder/__init__: avoids ~90 trivial docstrings;
+#               public classes (D101) and functions (D103) are still required.
+ignore = ["N801", "N803", "N806", "N812", "N814", "D102", "D105", "D107"]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export hubs: unused imports and missing package docstrings are expected.
+"**/__init__.py" = ["F401", "D104"]
+# Tests and scripts are not library surface: skip docstring + naming churn.
+"tests/**" = ["D", "N"]
+"scripts/**" = ["D", "N"]
+"runs/**" = ["D", "N"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

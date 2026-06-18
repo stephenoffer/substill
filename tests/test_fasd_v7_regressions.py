@@ -179,7 +179,7 @@ def test_refresh_from_profile_preserves_folded_shape():
     big_profile = [_Branch("a", d=16, k=12)]
     loss_fn.refresh_from_profile(big_profile)
 
-    V = loss_fn._get_V("a")
+    V = loss_fn._get_v("a")
     assert V.shape == (16, 4), (
         f"folded branch's V must stay at (16, 4), got {V.shape} — "
         "refresh would break the folded forward"
@@ -189,7 +189,7 @@ def test_refresh_from_profile_preserves_folded_shape():
     # Refresh with a SMALLER behavioral rank (don't upsize silently either).
     small_profile = [_Branch("a", d=16, k=2)]
     loss_fn.refresh_from_profile(small_profile)
-    V2 = loss_fn._get_V("a")
+    V2 = loss_fn._get_v("a")
     assert V2.shape == (16, 4)
     assert loss_fn.branch_ks["a"] == 4
 
@@ -227,8 +227,8 @@ def test_col_basis_uses_pca_tail_when_under_ranked():
 
 def test_resolve_fold_frac_picks_procrustes_start():
     """Default schedule should fold at the Procrustes phase boundary (0.40)."""
-    from fasd.training.distill import _resolve_fold_frac
     from fasd.losses.subspace import default_schedule
+    from fasd.training.distill import _resolve_fold_frac
 
     sched = default_schedule()
     assert _resolve_fold_frac(sched, None) == 0.40
@@ -429,7 +429,8 @@ def test_gpt2_absorb_full_size_reproduces_teacher():
     assert int(student.config.n_embd) == 64, "student must keep teacher's hidden size"
     assert int(student.config.n_inner) == 256
 
-    teacher.eval(); student.eval()
+    teacher.eval()
+    student.eval()
     torch.manual_seed(0)
     ids = torch.randint(1, 64, (2, 16))
     am = torch.ones_like(ids)

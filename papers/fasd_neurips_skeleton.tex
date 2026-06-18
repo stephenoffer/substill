@@ -1,0 +1,607 @@
+% =============================================================================
+% NeurIPS / CVPR submission skeleton.
+% Scaffolding only: every \todo{...} marks an experiment, baseline, ablation,
+% or claim that DOES NOT YET EXIST in our results and must be produced before
+% submission. Compile this with neurips_2024.sty in the same directory.
+% =============================================================================
+\documentclass{article}
+
+% Use \usepackage[final]{neurips_2024} for camera-ready;
+% \usepackage{neurips_2024} for anonymous submission.
+\usepackage[preprint]{neurips_2024}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{enumitem}
+\usepackage{natbib}
+
+% --- TODO highlighting --------------------------------------------------------
+% \todo{...}     — inline yellow highlight for missing content
+% \todoexp{...}  — red callout for a missing experiment
+% \todocite{}    — placeholder citation
+\newcommand{\todo}[1]{\textcolor{orange}{\textbf{[TODO:} #1\textbf{]}}}
+\newcommand{\todoexp}[1]{\textcolor{red}{\textbf{[TODO-EXPERIMENT:} #1\textbf{]}}}
+\newcommand{\todocite}{\textcolor{blue}{\textbf{[CITE]}}}
+
+% --- macros -------------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\PPL}{\mathrm{PPL}}
+\newcommand{\Vin}{V_{\mathrm{in}}}
+\newcommand{\Vout}{V_{\mathrm{out}}}
+\newcommand{\fasd}{\texorpdfstring{\textsc{F-ASD}}{F-ASD}}
+\newcommand{\asd}{\texorpdfstring{\textsc{ASD}}{ASD}}
+\newcommand{\pra}{\texorpdfstring{\textsc{PRA}}{PRA}}
+
+\title{F-ASD: Functionally-Aligned Activation Subspace Distillation\\for Large Language Models}
+
+\author{%
+  Stephen Offer \\
+  Anyscale \\
+  \texttt{stephen.offer@anyscale.com}
+  \\\\\todo{add co-authors}
+}
+
+\begin{document}
+
+\maketitle
+
+% =============================================================================
+\begin{abstract}
+% =============================================================================
+We present \fasd{}, a structured-distillation framework for compressing
+large language models that aligns student weights with the teacher's
+data-driven principal components via an \emph{absorbed initialisation} and
+trains the student under a logit-space skew-KL objective with on-policy
+generation. \fasd{} extends our prior \asd{} framework (vision +
+language) with three contributions: streaming-PCA per-branch profiling,
+absorbed weight initialisation, and a matched-compression rank allocator that
+removes a confound common in structured-distillation ablations.
+\todo{State headline result once full experiments complete: ``\fasd{}
+achieves $X$ perplexity at $Y\times$ compression of $Z$, outperforming
+DistilGPT2 / MiniLM / TinyBERT by $W\%$ on $K$ downstream tasks.''}
+We additionally analyse Periodic Re-Absorption (\pra{}), a
+training-time mechanism for refreshing the absorbed bases, and report
+\todo{either: corrected-PRA gives a further $\Delta$ improvement (positive),
+or: properly-implemented PRA still hurts and we explain why (negative)}.
+Code and configs at \todo{anonymised URL}.
+\end{abstract}
+
+% =============================================================================
+\section{Introduction}
+% =============================================================================
+\todo{Open with the LLM-deployment-cost framing (latency, memory, energy);
+cite recent inference-cost papers \todocite. Establish the practical stakes.}
+
+\todo{Position structured distillation against logit-only KD and against
+pruning. One sentence per: KD is generic but ignores internal structure;
+pruning removes individual weights but preserves architecture; structured
+distillation aligns subspaces and rebuilds a smaller architecture.}
+
+\todo{Name the gap: prior structured-distillation work on LLMs uses random
+or SVD initialisation and either activation-space or logit-space losses, but
+not the combination of (a)~data-driven per-branch ranks, (b)~absorbed
+weight initialisation, and (c)~on-policy logit distillation that we will
+show is necessary for clean compression at $4\times$.}
+
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=*,nosep]
+  \item \fasd{}: a complete structured-distillation pipeline combining
+        streaming-PCA profiling, absorbed initialisation, and skew-KL +
+        on-policy distillation (\Cref{sec:method}).
+  \item A matched-compression rank allocator (\Cref{sec:matched}) that
+        decouples per-component ablation from architecture-capacity effects;
+        we show empirically that prior ablations on this kind of pipeline
+        are confounded without it.
+  \item State-of-the-art results on \todo{teacher families × datasets matrix}
+        at $2\times$ and $4\times$ compression (\Cref{sec:exp}).
+  \item An analysis of Periodic Re-Absorption (\pra{}) including
+        \todo{positive/negative resolution} and a precise diagnosis of the
+        Adam-state interaction (\Cref{sec:pra}).
+  \item Released code reproducing every result on
+        \todo{$K$ A10G-hours / $M$ A100-hours}.
+\end{enumerate}
+
+% =============================================================================
+\section{Background and Notation}
+\label{sec:back}
+% =============================================================================
+\todo{$\sim$0.5 page. Cover: knowledge distillation (Hinton; \todocite),
+structured / hidden-state distillation (FitNets, Patient-KD, MiniLM, TinyBERT
+\todocite), low-rank structure of trained models (LoRA, Aghajanyan,
+Sharma et al. \todocite). End with the notation used throughout: teacher
+$\Theta_T$ with weights $W_T \in \R^{C_{\mathrm{out}}\times C_{\mathrm{in}}}$
+per layer, principal components $\Vin \in \R^{C_{\mathrm{in}}\times c}$ from
+input-side activations, $\Vout$ from output-side activations.}
+
+% =============================================================================
+\section{Method: From ASD to \fasd{}}
+\label{sec:method}
+% =============================================================================
+
+\subsection{ASD: Activation Subspace Distillation (precursor)}
+\label{sec:method:asd}
+\todo{Compress to $\sim$0.5 page summary of \asd{}: covariance-based
+profiling, per-stage rank reduction, three subspace losses (coord-MSE, Gram,
+CKA), random init with trainable projectors. Cite full description in
+\Cref{app:asd} below.}
+
+\subsection{\fasd{}: three changes for LLM distillation}
+\label{sec:method:fasd}
+
+\paragraph{Streaming-PCA per-branch profiling.}
+\todo{State the streaming-PCA algorithm in 4--6 lines of math. Show that
+peak memory is $O(C \cdot r_{\max})$ vs $O(C^2)$ for covariance, and that
+empirical principal-angle distance to the offline solution is
+\todoexp{measure on GPT-2-medium: should be $<2^\circ$ for $r_{\max}=256$}.
+This justifies streaming-PCA as both faster and statistically equivalent.}
+
+\paragraph{Absorbed initialisation.}
+For each absorption-eligible weight matrix $W_T$ with input components $\Vin$
+and output components $\Vout$ (selected from the streaming-PCA output by
+behavioural rank, defined below), the student weight is
+\begin{equation}
+\label{eq:absorb}
+W_S \;=\; \Vout^\top \, W_T \, \Vin \;\in\; \R^{c_{\mathrm{out}} \times c_{\mathrm{in}}}.
+\end{equation}
+\todo{One paragraph showing this is the optimal projection in the sense
+that it minimises $\norm{W_T - \Vout W_S \Vin^\top}_F$ over $W_S$. Cite
+Eckart--Young.}
+
+\paragraph{Behavioural rank.}
+\todo{Define $k^{\mathrm{beh}}_\ell = \min\{k : \sum_{i \le k} \lambda_i \ge
+(1-\tau) \sum_i \lambda_i\}$ with $\tau = 0.02$. Compare to ASD's effective
+rank: behavioural rank uses a single tolerance instead of four definitions,
+and operates on streaming-PCA output rather than full covariance.
+\todoexp{Add Fig.~$X$: per-branch behavioural rank distribution on
+GPT-2-medium across all $24 \times 4 = 96$ absorption sites.}}
+
+\paragraph{Skew-KL with on-policy generation.}
+\begin{equation}
+\label{eq:skewkl}
+\mathcal{L}_{\mathrm{skew}} \;=\; \KL\!\left[\, p_T \;\big\|\; \alpha\, p_T + (1 - \alpha)\, p_S \,\right]
+\end{equation}
+with $\alpha = 0.1$, $\tau_{\mathrm{KD}} = 1$, matching the mass-covering
+formulation of \citet{Ko2024DistiLLM}. Beyond a configurable training
+fraction \texttt{on\_policy\_start}, half of every batch is replaced
+with greedy continuations from the student
+\citep{Agarwal2024GKD}. \todo{One sentence on why each helps the small-student case.}
+
+% =============================================================================
+\section{Matched-Compression Rank Allocation}
+\label{sec:matched}
+% =============================================================================
+\todo{Open with the confound: in our prior ladder \texttt{v10}, the most
+successful rung achieved its low PPL at $1.52\times$ compression while the
+random-initialised baseline ran at $3.93\times$. Without holding compression
+fixed, perplexity differences cannot be attributed to algorithmic
+contributions.}
+
+\begin{algorithm}[t]
+\caption{Matched-compression \texttt{arch\_multiplier} search.}
+\label{alg:matched}
+\begin{algorithmic}[1]
+\Require teacher $\Theta_T$, profile $\Pi$, target compression $C^\star$, tolerance $\eta$
+\State $P_T \gets \mathrm{ParamCount}(\Theta_T)$;\quad $P^\star \gets P_T / C^\star$
+\State $\mu_{\mathrm{lo}} \gets 0.05; \mu_{\mathrm{hi}} \gets 32$
+\For{$i = 1 \ldots 24$}
+  \State $\mu \gets (\mu_{\mathrm{lo}} + \mu_{\mathrm{hi}})/2$
+  \State $\Theta_S \gets \mathrm{Build}(\Theta_T, \Pi, \mu)$
+  \State $P \gets \mathrm{ParamCount}(\Theta_S)$
+  \If{$P > P^\star$} $\mu_{\mathrm{hi}} \gets \mu$ \Else{} $\mu_{\mathrm{lo}} \gets \mu$ \EndIf
+  \If{$|P/P^\star - 1| \le \eta$} \textbf{break} \EndIf
+\EndFor
+\State \Return $\mu$
+\end{algorithmic}
+\end{algorithm}
+
+\todo{One paragraph on empirical verification: at GPT-2-medium with
+$\eta = 0.02$, requesting $2\times$ returns $\mu \approx 0.81$ and produces
+a $177$M-parameter student (actual $2.005\times$); $4\times$ returns
+$\mu \approx 0.50$ for $88.7$M (actual $4.00\times$). Search converges in
+$\le 12$ iterations.}
+
+\paragraph{Why this matters for ablations.}
+\todoexp{Add Fig.~$X$ showing the v10 confound: bar chart of \texttt{rung}
+on $x$-axis, with two bars per rung (one for compression ratio, one for
+final PPL on a secondary axis). Make visible that the apparent ranking
+inverts when compression is matched.}
+
+% =============================================================================
+\section{Periodic Re-Absorption}
+\label{sec:pra}
+% =============================================================================
+\todo{Motivation: bases drift during training. Algorithm
+(residual-preserving re-projection): for old bases
+$\Vin^{\mathrm{old}}, \Vout^{\mathrm{old}}$, new bases
+$\Vin^{\mathrm{new}}, \Vout^{\mathrm{new}}$, and student weight
+$W_S = W_S^{(0)} + \Delta$, set
+$W_S' = \Vout^{\mathrm{new}\top} W_T \Vin^{\mathrm{new}}
+       + R_{\mathrm{out}} \, \Delta \, R_{\mathrm{in}}^\top$
+with $R_{\mathrm{in}}=\Vin^{\mathrm{new}\top}\Vin^{\mathrm{old}}$,
+$R_{\mathrm{out}}=\Vout^{\mathrm{new}\top}\Vout^{\mathrm{old}}$. Rotate
+Adam's first moment by the same map; \emph{do not} reset the second
+moment without a corresponding warmup (see diagnosis below).}
+
+\todoexp{Run corrected-PRA versions: (i) rotate-$v$ via elementwise-square
+heuristic; (ii) reset-$v$-and-$t$ jointly; (iii) post-PRA learning-rate
+warmup. Each at $\{100, 200, 500\}$-step cadence. $\geq$3 seeds.}
+
+\todo{If a corrected version helps: positive contribution paragraph with
+$\Delta$PPL vs no-PRA control + statistical test. If none help: negative
+paragraph framing the result as a useful warning.}
+
+\paragraph{Diagnosis: Adam moment-reset interaction.}
+\todo{Reproduce diagnosis from preprint: $v$ reset without $t$ reset leaves
+$1 - \beta_2^t \approx 1$, so $\hat{v}$ is $\sim 1000\times$ smaller than
+equilibrium and effective LR explodes by $\sim$$30\times$. Quantitative
+plot: $\hat{v}$ trajectory pre- and post-PRA \todoexp{logged trace from
+one rung}.}
+
+% =============================================================================
+\section{Experiments}
+\label{sec:exp}
+% =============================================================================
+
+\subsection{Setup}
+\label{sec:exp:setup}
+
+\todo{Teachers: GPT-2-medium ($354.8$M, exercised),
+\todoexp{add GPT-2-large ($774$M)}, \todoexp{add Llama-2-7B}.
+Justify with footprint of these in production.}
+
+\todo{Datasets: WikiText-2 (exercised), \todoexp{add WikiText-103},
+\todoexp{add OpenWebText-10\% subset}, \todoexp{add C4-validation as held-out}.}
+
+\todo{Schedule: \todoexp{$5000$ steps minimum (currently 1000)} at batch
+$\todoexp{16}$ (currently 4), seq-len $\todoexp{1024}$ (currently 128). Lr $5e\!-\!4$
+linear warmup $\todoexp{500}$ steps cosine decay. Adam $\beta_2 = 0.999$.}
+
+\todo{Seeds: $\todoexp{3 \text{ per cell}}$.}
+
+\todo{Compression targets: $2\times$ and $4\times$ (exercised);
+\todoexp{add $1.5\times$ for the easy regime and $8\times$ for the hard
+regime}.}
+
+\subsection{Baselines}
+\label{sec:exp:baselines}
+\todo{The baselines that reviewers will demand:}
+\begin{itemize}[leftmargin=*,nosep]
+  \item \textbf{No-distillation pretraining.} \todoexp{Train a student of
+        identical architecture from scratch on the same corpus.}
+  \item \textbf{Hinton KD.} \todoexp{Same student architecture as \fasd{} but
+        trained only with KL-on-logits at $\tau=4$.}
+  \item \textbf{DistilGPT2-style.} \todoexp{Re-train the public DistilGPT2
+        recipe on our corpus + schedule for fair comparison.}
+  \item \textbf{MiniLM-style hidden-state distillation.} \todoexp{Match
+        attention distributions and value projections per
+        \citet{Wang2020MiniLM}.}
+  \item \textbf{Wanda / SparseGPT.} \todoexp{One-shot pruning baseline at
+        matched compression; gives a no-training upper bound on damage.}
+  \item \textbf{ASD v1.} \todoexp{Run the ASD codebase at the same
+        compression target on the same data; isolates the v1$\to$v2 delta.}
+\end{itemize}
+
+\subsection{Main results}
+\label{sec:exp:main}
+
+\todoexp{Replace this stub with a proper $K$-row table. Rows = methods,
+columns = (compression, val PPL, val NLL, LAMBADA acc, HellaSwag acc,
+training GPU-h, inference tok/s). Bold the winner per column.}
+
+\begin{table}[t]
+\centering
+\small
+\caption{\fasd{} v11 ladder, GPT-2-medium teacher, WikiText-2,
+single seed, 1000 steps. \todo{Replace with full table after seeds + larger
+schedule.} ``actual'' is the realised compression after \Cref{alg:matched}.}
+\label{tab:v11}
+\begin{tabular}{lcccc}
+\toprule
+Rung & target $\times$ & actual $\times$ & student M & final PPL\\
+\midrule
+\multicolumn{5}{l}{\emph{Compression $2\times$}} \\
+\texttt{r1\_static}            & 2.0 & 2.005 & 177.0 & \textbf{181.2}    \\
+\texttt{r0\_random}            & 2.0 & 2.005 & 177.0 & 658.0             \\
+\texttt{r3\_pra100}            & 2.0 & 2.000 & 177.7 & $6.4\times10^{4}$ \\
+\texttt{r2\_pra200}            & 2.0 & 2.000 & 177.7 & $1.5\times10^{18}\,^\dagger$ \\
+\texttt{r4\_pra200\_onpolicy}  & 2.0 & --    & --    & \todo{pending}    \\
+\midrule
+\multicolumn{5}{l}{\emph{Compression $4\times$}} \\
+\texttt{r1\_static}            & 4.0 & 4.000 & 88.7  & \textbf{314.8}    \\
+\texttt{r0\_random}            & 4.0 & 4.022 & 88.2  & 733.5             \\
+\texttt{r3\_pra100}            & 4.0 & 4.000 & 88.7  & 3{,}803.3         \\
+\texttt{r2\_pra200}            & 4.0 & 4.000 & 88.7  & $6.4\times10^{4}$ \\
+\texttt{r4\_pra200\_onpolicy}  & 4.0 & --    & --    & \todo{pending}    \\
+\bottomrule
+\multicolumn{5}{l}{\small Teacher PPL: $43.2$. $^\dagger$ numerical divergence.}
+\end{tabular}
+\end{table}
+
+\subsection{Component ablations}
+\label{sec:exp:ablations}
+\todo{Table breaking down the v1$\to$v2 delta:}
+\begin{itemize}[leftmargin=*,nosep]
+  \item ASD v1 (covariance + Gram loss + random init + trainable projectors)
+  \item v1 + streaming-PCA profiling
+  \item v1 + absorbed init (folds projectors)
+  \item v1 + skew-KL (logit-space loss)
+  \item v1 + on-policy generation
+  \item full \fasd{} v2 = v1 + all of the above
+\end{itemize}
+\todoexp{Run each at matched $2\times$ and $4\times$, $\geq 3$ seeds.}
+
+\subsection{Compression sweep}
+\label{sec:exp:compression}
+\todo{Plot: $x$-axis = compression ratio in $\{1.5, 2, 3, 4, 6, 8\}$,
+$y$-axis = WikiText-103 PPL (or OpenWebText held-out NLL), one line per
+method. Show where each baseline breaks; show that \fasd{} degrades gracefully
+past $4\times$.} \todoexp{Costs $\sim$$72$ GPU-h.}
+
+\subsection{Downstream evaluation}
+\label{sec:exp:downstream}
+\todo{LAMBADA accuracy, HellaSwag accuracy, optional MMLU (will be near-random
+for $<1$B-param students; document anyway). Cite \texttt{lm-eval-harness}.}
+\todoexp{$\sim$$8$ GPU-h for full \fasd{}; $\sim$$48$ GPU-h for all baselines.}
+
+\subsection{Inference latency and memory}
+\label{sec:exp:latency}
+\todo{Table: teacher vs each compressed student on a single-A10G inference
+benchmark. Columns: tokens/sec at batch 1, batch 32, peak GPU memory,
+$\mathrm{KV}$-cache footprint at context $2048$.}
+
+% =============================================================================
+\section{Analysis}
+\label{sec:analysis}
+% =============================================================================
+\todo{Sub-sections to write:}
+\begin{itemize}[leftmargin=*,nosep]
+  \item \textbf{What does behavioural rank reveal about GPT-2's branches?}
+        \todoexp{Heatmap of behavioural rank vs.\ block index vs.\ branch type.
+        Hypothesis: deep-layer attention $V$ projections have lower rank than
+        early-layer FFNs.}
+  \item \textbf{How sensitive is \fasd{} to calibration size?}
+        \todoexp{$\PPL$ as a function of calibration tokens, log-scaled. Show
+        plateau location and use it to set the default.}
+  \item \textbf{When does absorbed init help vs.\ random?}
+        \todoexp{Compare initial PPL trajectory: absorbed init $\to$ steady
+        progress vs.\ random $\to$ longer warm-up. Validates the
+        ``warm-start'' framing.}
+  \item \textbf{Optimiser-state preservation under weight rotation.}
+        \todoexp{The corrected-PRA experiments naturally produce this analysis
+        if PRA is in the paper.}
+\end{itemize}
+
+% =============================================================================
+\section{Related Work}
+\label{sec:rel}
+% =============================================================================
+\todo{Four paragraphs:}
+\begin{itemize}[leftmargin=*,nosep]
+  \item Knowledge distillation (Hinton; FitNets; Patient-KD; MiniLM;
+        TinyBERT). \todocite
+  \item Low-rank structure of trained models (Aghajanyan; LoRA; Sharma;
+        LoRD). \todocite\ Position absorbed init relative to LoRD.
+  \item Structured pruning (Wanda; SparseGPT; LayerDrop; Sheared-Llama).
+        \todocite\ Distinguish: pruning removes weights, distillation
+        rebuilds.
+  \item Optimiser-state preservation under model surgery
+        (model soups; TIES-merging; weight averaging). \todocite
+\end{itemize}
+
+% =============================================================================
+\section{Limitations}
+\label{sec:limits}
+% =============================================================================
+\todo{Even after the experimental upgrades above, document remaining
+limitations honestly:}
+\begin{itemize}[leftmargin=*,nosep]
+  \item Architectural scope: we validate only on autoregressive transformers
+        in the GPT-2/Llama family. Not exercised: encoder-only (BERT-style),
+        encoder--decoder (T5), MoE, mamba.
+  \item Pretraining-only: we do not show that \fasd{}-distilled students
+        fine-tune as well as their teachers on instruction-tuning datasets.
+  \item Quantisation interaction: \texttt{quantize=True} works in our codebase
+        but we do not characterise the quantisation--distillation joint
+        Pareto frontier.
+  \item Hardware specificity: latency claims are A10G-only; H100/Blackwell
+        characteristics differ.
+\end{itemize}
+
+% =============================================================================
+\section{Conclusion}
+% =============================================================================
+\todo{Restate three contributions; one paragraph on what \fasd{} enables
+practically (cite the inference-latency improvements measured in
+Sec.~\ref{sec:exp:latency}); one paragraph on open problems
+(corrected PRA; encoder-only; longer training).}
+
+% =============================================================================
+\section*{Broader Impact}
+% =============================================================================
+\todo{NeurIPS now mostly optional. CVPR not required. If included: one
+short paragraph on energy savings from smaller inference, balanced by
+risks of more-deployable LLMs (misuse, content moderation cost).}
+
+% =============================================================================
+\section*{Reproducibility Statement}
+% =============================================================================
+\todo{Code release URL, exact commit hash, exact GPU-hours, exact
+random seeds used per cell, link to S3 bucket holding result JSONs.}
+
+% =============================================================================
+% Bibliography mirrors fasd_preprint.tex (verified citations only).
+% Add baselines as they're benchmarked: Sheared-Llama, lm-eval-harness, etc.
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}\small
+
+\bibitem[Agarwal et al.(2024)]{Agarwal2024GKD}
+R.~Agarwal, N.~Vieillard, Y.~Zhou, P.~Stanczyk, S.~Ramos, M.~Geist, and O.~Bachem.
+\newblock On-policy distillation of language models: Learning from self-generated mistakes.
+\newblock In \emph{ICLR}, 2024. arXiv:2306.13649.
+
+\bibitem[Aghajanyan et al.(2021)]{Aghajanyan2021}
+A.~Aghajanyan, S.~Gupta, and L.~Zettlemoyer.
+\newblock Intrinsic dimensionality explains the effectiveness of language model fine-tuning.
+\newblock In \emph{ACL}, 2021.
+
+\bibitem[Eckart and Young(1936)]{EckartYoung1936}
+C.~Eckart and G.~Young.
+\newblock The approximation of one matrix by another of lower rank.
+\newblock \emph{Psychometrika}, 1(3):211--218, 1936.
+
+\bibitem[Frantar and Alistarh(2023)]{Frantar2023SparseGPT}
+E.~Frantar and D.~Alistarh.
+\newblock {SparseGPT}: Massive language models can be accurately pruned in one-shot.
+\newblock In \emph{ICML}, 2023. arXiv:2301.00774.
+
+\bibitem[Hinton et al.(2015)]{Hinton2015}
+G.~Hinton, O.~Vinyals, and J.~Dean.
+\newblock Distilling the knowledge in a neural network.
+\newblock In \emph{NeurIPS Deep Learning Workshop}, 2015. arXiv:1503.02531.
+
+\bibitem[Hu et al.(2022)]{Hu2022LoRA}
+E.~J. Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, and W.~Chen.
+\newblock {LoRA}: Low-rank adaptation of large language models.
+\newblock In \emph{ICLR}, 2022. arXiv:2106.09685.
+
+\bibitem[Jiao et al.(2020)]{Jiao2020TinyBERT}
+X.~Jiao, Y.~Yin, L.~Shang, X.~Jiang, X.~Chen, L.~Li, F.~Wang, and Q.~Liu.
+\newblock {TinyBERT}: Distilling {BERT} for natural language understanding.
+\newblock In \emph{Findings of EMNLP}, 2020. arXiv:1909.10351.
+
+\bibitem[Kaushal et al.(2023)]{Kaushal2023LoRD}
+A.~Kaushal, T.~Vaidhya, and I.~Rish.
+\newblock {LoRD}: Low rank decomposition of monolingual code {LLMs} for one-shot compression.
+\newblock arXiv:2309.14021, 2023.
+
+\bibitem[Ko et al.(2024)]{Ko2024DistiLLM}
+J.~Ko, S.~Kim, T.~Chen, and S.-Y. Yun.
+\newblock {DistiLLM}: Towards streamlined distillation for large language models.
+\newblock In \emph{ICML}, 2024. arXiv:2402.03898.
+
+\bibitem[Kornblith et al.(2019)]{Kornblith2019CKA}
+S.~Kornblith, M.~Norouzi, H.~Lee, and G.~Hinton.
+\newblock Similarity of neural network representations revisited.
+\newblock In \emph{ICML}, 2019.
+
+\bibitem[Romero et al.(2015)]{Romero2014FitNets}
+A.~Romero, N.~Ballas, S.~E. Kahou, A.~Chassang, C.~Gatta, and Y.~Bengio.
+\newblock {FitNets}: Hints for thin deep nets.
+\newblock In \emph{ICLR}, 2015. arXiv:1412.6550.
+
+\bibitem[Sanh et al.(2019)]{Sanh2019DistilBERT}
+V.~Sanh, L.~Debut, J.~Chaumond, and T.~Wolf.
+\newblock {DistilBERT}, a distilled version of {BERT}.
+\newblock In \emph{NeurIPS EMC$^2$ Workshop}, 2019. arXiv:1910.01108.
+
+\bibitem[Sharma et al.(2024)]{Sharma2024LASER}
+P.~Sharma, J.~T. Ash, and D.~Misra.
+\newblock The truth is in there: Improving reasoning in language models with layer-selective rank reduction ({LASER}).
+\newblock In \emph{ICLR}, 2024. arXiv:2312.13558.
+
+\bibitem[Sun et al.(2019)]{Sun2019PatientKD}
+S.~Sun, Y.~Cheng, Z.~Gan, and J.~Liu.
+\newblock Patient knowledge distillation for {BERT} model compression.
+\newblock In \emph{EMNLP}, 2019.
+
+\bibitem[Sun et al.(2024)]{Sun2023Wanda}
+M.~Sun, Z.~Liu, A.~Bair, and J.~Z. Kolter.
+\newblock A simple and effective pruning approach for large language models ({Wanda}).
+\newblock In \emph{ICLR}, 2024. arXiv:2306.11695.
+
+\bibitem[Wang et al.(2020)]{Wang2020MiniLM}
+W.~Wang, F.~Wei, L.~Dong, H.~Bao, N.~Yang, and M.~Zhou.
+\newblock {MiniLM}: Deep self-attention distillation for task-agnostic compression of pre-trained transformers.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem[Wortsman et al.(2022)]{Wortsman2022ModelSoups}
+M.~Wortsman et al.
+\newblock Model soups: Averaging weights of multiple fine-tuned models improves accuracy without increasing inference time.
+\newblock In \emph{ICML}, 2022.
+
+\bibitem[Yadav et al.(2023)]{Yadav2023TIES}
+P.~Yadav, D.~Tam, L.~Choshen, C.~Raffel, and M.~Bansal.
+\newblock {TIES}-merging: Resolving interference when merging models.
+\newblock In \emph{NeurIPS}, 2023.
+
+\end{thebibliography}
+
+% =============================================================================
+\appendix
+% =============================================================================
+
+\section{ASD v1 Full Description}
+\label{app:asd}
+\todo{Compress the ASD section from \texttt{fasd\_preprint.tex} into this
+appendix; main text just references it. Include the four rank definitions,
+two noise models, three loss variants.}
+
+\section{Hyperparameter Tables}
+\label{app:hp}
+\todo{Table per method × dataset × teacher with all hyperparameters used.
+Reviewers will want this.}
+
+\section{Additional Results}
+\label{app:extra}
+\todo{Per-seed breakdowns (mean, std, min, max). Per-step training curves.
+Per-branch absorbed-rank statistics.}
+
+\section{Failed Approaches}
+\label{app:failed}
+\todo{If corrected PRA still fails: full diagnostic plots of the Adam
+moment-rotation analysis. If any other promising direction failed during
+development, document it briefly.}
+
+% =============================================================================
+% =============================================================================
+% UPGRADE CHECKLIST FOR REVIEWERS-CAN-DESK-REJECT BAR
+% =============================================================================
+% =============================================================================
+%
+% Order roughly by reviewer impact:
+%
+% 1. [ ] $\geq 3$ seeds per cell on the headline table.
+% 2. [ ] $\geq 1$ external baseline in \{DistilGPT2, MiniLM\} + 1 pruning
+%        baseline in \{Wanda, SparseGPT\}.
+% 3. [ ] $\geq 1$ downstream eval (recommend LAMBADA acc; cheap to run).
+% 4. [ ] $\geq 5\times$ training schedule ($5{,}000$ steps minimum; ideally
+%        $20{,}000$ for the headline cells).
+% 5. [ ] Llama-2-7B teacher run at $\geq 1$ compression ratio. This is the
+%        most expensive single ask but also the highest-leverage one.
+% 6. [ ] Either: corrected PRA works (positive PRA result), OR drop PRA to
+%        an appendix as a documented failure with diagnosis. Decide based on
+%        first run of the rotate-$v$ heuristic; budget 8 GPU-h.
+% 7. [ ] Inference latency table on a real serving stack (vLLM or TGI).
+% 8. [ ] WikiText-103 in addition to WikiText-2 (current corpus is too small
+%        to claim generalisation).
+% 9. [ ] Confidence intervals (bootstrap) on every reported metric.
+% 10.[ ] Anonymise URLs and acknowledgements before submission.
+%
+% Rough budget (single-A10G hours):
+%   Item 1 (seeds):                    $40$ h
+%   Item 2 (baselines):                $30$ h
+%   Item 3 (downstream eval):          $5$ h
+%   Item 4 (longer schedule):          $80$ h
+%   Item 5 (Llama-2-7B run):           $200$+ h  (needs A100 actually)
+%   Item 6 (PRA corrections):          $20$ h
+%   Item 7 (latency benchmarks):       $5$ h
+%   Item 8 (WikiText-103):             $40$ h
+%   Subtotal pre-Llama:                $\sim 220$ A10G-hours
+%   With Llama:                         $\sim 220$ A10G-h + $200$ A100-h
+%
+% =============================================================================
+
+\end{document}

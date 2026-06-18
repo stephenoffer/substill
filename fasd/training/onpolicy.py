@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import random
 from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Iterable, Iterator
 
 import torch
 import torch.nn as nn

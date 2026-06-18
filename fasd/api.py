@@ -1,16 +1,16 @@
 """Top-level F-ASD API: profile, capture, TeacherProfile, BranchProfile.
 
-Mirrors the shape of :mod:`asd.api` — profile produces a pickle-safe
-snapshot, capture exposes per-branch hidden states, and :class:`F_ASDLoss`
-plugs into the user's training loop.
+Profile produces a pickle-safe snapshot, capture exposes per-branch hidden
+states, and :class:`F_ASDLoss` plugs into the user's training loop.
 """
 
 from __future__ import annotations
 
 import pickle
-from dataclasses import dataclass, field, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -22,10 +22,10 @@ from .profiling.activation_capture import (
     BranchHiddenCapture,
 )
 from .profiling.behavioral_rank import choose_behavioral_rank
-from .profiling.streaming_pca import StreamingPCA, auto_backend
-from .profiling.token_weighting import compute_weights, Method as WeightMethod
 from .profiling.stability import bootstrap_principal_angles  # noqa: F401
-
+from .profiling.streaming_pca import auto_backend
+from .profiling.token_weighting import Method as WeightMethod
+from .profiling.token_weighting import compute_weights
 
 # -- BranchProfile / TeacherProfile ------------------------------------
 
@@ -72,7 +72,7 @@ class TeacherProfile:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @classmethod
-    def load(cls, path: str | Path) -> "TeacherProfile":
+    def load(cls, path: str | Path) -> TeacherProfile:
         with Path(path).open("rb") as f:
             obj = pickle.load(f)
         if not isinstance(obj, cls):
@@ -88,6 +88,7 @@ class DistillResult:
     profile: TeacherProfile
     history: list[dict]
     best_metric: float | None = None
+    final_metric: float | None = None
     teacher_metric: float | None = None
     val_kl_forward: float | None = None
     val_kl_reverse: float | None = None

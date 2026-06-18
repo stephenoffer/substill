@@ -30,7 +30,8 @@ Supports two searches:
 
 from __future__ import annotations
 
-from typing import Iterable, Literal
+from collections.abc import Iterable
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -39,7 +40,6 @@ from torch.nn import functional as F
 
 from ..autodetect import BranchSpec
 from .activation_capture import _get_module
-
 
 Search = Literal["bisect", "linear"]
 
@@ -221,7 +221,7 @@ def choose_behavioral_rank(
         Device on which to run the teacher. Defaults to the teacher's
         current device.
 
-    Returns
+    Returns:
     -------
     (k, kl_curve)
         ``k`` is the chosen rank. ``kl_curve`` is a list of
@@ -232,7 +232,6 @@ def choose_behavioral_rank(
         raise ValueError(f"min_rank must be >= 1, got {min_rank}")
     if basis.dim() != 2:
         raise ValueError(f"basis must be (C, C) or (C, K), got {tuple(basis.shape)}")
-    C = basis.shape[0]
     K_full = basis.shape[1]
     if max_rank is None:
         max_rank = K_full

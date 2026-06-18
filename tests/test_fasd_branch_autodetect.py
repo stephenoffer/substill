@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import pytest
-import torch
 import torch.nn as nn
 
-from fasd.autodetect import BranchSpec, autodetect_branches
+from fasd.autodetect import autodetect_branches
 
 
 def _try_gpt2_tiny():

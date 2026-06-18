@@ -25,14 +25,14 @@ unquantized teacher and quantized student should have close outputs.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Literal
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-
 
 Scheme = Literal["awq", "minmax"]
 
@@ -61,8 +61,6 @@ def _group_quantize(
     W: Tensor,
     bits: int,
     group_size: int,
-    *,
-    sym: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
     """Per-group symmetric quantization along the last dim.
 
@@ -211,7 +209,9 @@ class QuantizedLinear(nn.Module):
 
 
 class QuantizedConv1D(QuantizedLinear):
-    """HF GPT-2 ``Conv1D`` stores weight as ``(d_in, d_out)`` and applies
+    """Quantized variant of HF GPT-2 ``Conv1D`` (weight stored as ``(d_in, d_out)``).
+
+    HF GPT-2 ``Conv1D`` stores weight as ``(d_in, d_out)`` and applies
     ``x @ W + b``. This subclass transposes on forward to match that
     convention. Inherits the fp32-master-weight + STE fake-quant scheme.
     """
@@ -290,7 +290,9 @@ def quantize_student(
             report.skipped.append(name)
             continue
         try:
-            _replace_linear(student, name, module, profile, scheme, bits, group_size, protect_fraction)
+            _replace_linear(
+                student, name, module, profile, scheme, bits, group_size, protect_fraction
+            )
             report.replaced += 1
         except Exception as e:  # pragma: no cover
             report.skipped.append(f"{name} ({type(e).__name__}: {e})")
@@ -385,8 +387,6 @@ def qad_finetune(
     directly — so this loop transparently updates the bulk of the quantized
     weights along with bias / protected_weight / embeddings / LN.
     """
-    from .quantization import QuantizedLinear as _QL  # avoid circular name shadowing
-
     trainable = [
         p for p in student.parameters() if p.requires_grad
     ]

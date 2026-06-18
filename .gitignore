@@ -12,5 +12,17 @@ venv/
 *.pt
 *.pth
 .pytest_cache/
+.ruff_cache/
 *.log
 .DS_Store
+
+# Experiment outputs (regenerable; not committed).
+/runs/
+
+# LaTeX build artifacts under papers/ (keep .md and .tex sources).
+papers/*.pdf
+papers/*.aux
+papers/*.fls
+papers/*.fdb_latexmk
+papers/*.out
+papers/*.synctex.gz

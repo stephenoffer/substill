@@ -36,9 +36,8 @@ this module:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Literal
+from typing import Literal
 
-import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
@@ -49,7 +48,6 @@ from .procrustes import (
     norm_calibration,
     procrustes_distance,
 )
-
 
 Objective = Literal["gram", "cka", "procrustes"]
 
@@ -132,7 +130,7 @@ class Schedule:
             return pts[0][1]
         if frac >= pts[-1][0]:
             return pts[-1][1]
-        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
             if x0 <= frac <= x1:
                 if x1 == x0:
                     return y1
@@ -160,7 +158,7 @@ def _l2_normalize(Z: Tensor, eps: float = 1e-6) -> Tensor:
     return F.normalize(Z, dim=-1, eps=eps)
 
 
-def _to_NK(Z: Tensor) -> Tensor:
+def _to_nk(Z: Tensor) -> Tensor:
     """Flatten any leading batch/time dims to give ``(N, k)``."""
     if Z.dim() <= 1:
         raise ValueError(f"expected 2+D tensor, got {Z.shape}")
@@ -253,10 +251,7 @@ class F_ASDLoss(nn.Module):
     ) -> None:
         super().__init__()
         # Accept TeacherProfile or a raw list of BranchProfile.
-        if hasattr(profile, "branches"):
-            branches = list(profile.branches)
-        else:
-            branches = list(profile)
+        branches = list(profile.branches) if hasattr(profile, "branches") else list(profile)
         if not branches:
             raise ValueError("F_ASDLoss requires at least one BranchProfile")
 
@@ -304,13 +299,13 @@ class F_ASDLoss(nn.Module):
             layer = orthogonal(layer)
         return layer
 
-    def _get_V(self, name: str) -> Tensor:
+    def _get_v(self, name: str) -> Tensor:
         i = self._branch_index[name]
         return getattr(self, f"V_{i}")
 
     def _project_teacher(self, name: str, hidden: Tensor) -> Tensor:
-        V = self._get_V(name).to(device=hidden.device, dtype=hidden.dtype)
-        return _to_NK(hidden @ V)
+        V = self._get_v(name).to(device=hidden.device, dtype=hidden.dtype)
+        return _to_nk(hidden @ V)
 
     def _project_student(self, name: str, hidden: Tensor) -> Tensor:
         key = self._safe_key(name)
@@ -322,13 +317,13 @@ class F_ASDLoss(nn.Module):
                     f"branch {name!r} is folded but student hidden dim {in_dim} "
                     f"!= retained rank {k}. Re-fold after shape changes."
                 )
-            return _to_NK(hidden)
+            return _to_nk(hidden)
         if key not in self.projectors:
             self.projectors[key] = self._make_projector(in_dim, k).to(
                 device=hidden.device, dtype=hidden.dtype
             )
         proj = self.projectors[key].to(device=hidden.device, dtype=hidden.dtype)
-        return _to_NK(proj(hidden))
+        return _to_nk(proj(hidden))
 
     # -- public forward -----------------------------------------------
 

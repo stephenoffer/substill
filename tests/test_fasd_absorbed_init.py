@@ -75,7 +75,6 @@ def test_absorbed_weight_rank_k_approximates_teacher_within_tail():
     W_s = absorbed_weight(W, V_in, None, layout="linear")  # (d_out, k_in)
     # Reconstruct approximate W by expanding back.
     W_approx = W_s @ V_in.T
-    tail_energy = float((S[k_in:] ** 2).sum().sqrt().item()) if len(S) > k_in else 0.0
     err = float((W - W_approx).norm().item())
     # Allow slack because S is a concatenation that does not exactly
     # match the singular spectrum of W — the test just asserts that the

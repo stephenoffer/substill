@@ -90,7 +90,7 @@ for SPEC in "${JOBS[@]}"; do
     ${EXTRA_ENV} \
     --env "HF_HOME=/mnt/cluster_storage/hf" \
     --env "PYTHONUNBUFFERED=1" \
-    -- bash -c "pip install --quiet transformers==5.6.1 datasets==3.6.0 tqdm && python scripts/fasd_ablation.py --rung '${RUNG}' --tag '${TAG}' --teacher ${TEACHER} --batch-size 4 --seq-len 128 --total-steps ${TOTAL_STEPS} --rank-tol 0.02 --max-rank ${MAX_RANK} --calib-batches 8 ${EXTRA_ARGS}"
+    -- bash -c "pip install --quiet transformers==5.6.1 datasets==3.6.0 tqdm && python scripts/fasd_ablation.py --rung '${RUNG}' --tag '${TAG}' --teacher ${TEACHER} --batch-size 4 --seq-len 128 --total-steps ${TOTAL_STEPS} --rank-tol 0.02 --max-rank ${MAX_RANK} --calib-batches 32 ${EXTRA_ARGS}"
 done
 
 echo

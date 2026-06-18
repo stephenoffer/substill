@@ -9,7 +9,7 @@ bootstrap splits.
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor
@@ -89,10 +89,7 @@ def stability_adjusted_rank(
                 )
                 if ang.numel() > 0:
                     angles.append(ang)
-        if angles:
-            angle_at_stable = float(torch.cat(angles).max().item())
-        else:
-            angle_at_stable = 0.0
+        angle_at_stable = float(torch.cat(angles).max().item()) if angles else 0.0
     return int(k_stable), float(angle_at_stable)
 
 

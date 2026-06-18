@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fasd.api import capture, profile as profile_fn
+from fasd.api import profile as profile_fn
 
 
 def _toy_gpt2():

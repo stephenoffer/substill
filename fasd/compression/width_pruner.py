@@ -21,9 +21,9 @@ chain rather than one big jump.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Literal
-
+from typing import Literal
 
 DepthPolicy = Literal["keep", "contiguous_tail", "contiguous_middle"]
 
@@ -55,10 +55,23 @@ def _round_up(x: int, multiple: int) -> int:
 
 
 def _branch_rank_by_kind(
-    branches: Iterable, kind: str, reducer: str = "max"
+    branches: Iterable, kind: str, reducer: str = "max",
+    rank_map: dict[str, int] | None = None,
 ) -> int | None:
-    """Aggregate behavioral rank across branches matching ``kind``."""
-    values = [int(b.behavioral_rank) for b in branches if b.kind == kind]
+    """Aggregate behavioral rank across branches matching ``kind``.
+
+    If ``rank_map`` is provided, the rank for branch ``b`` is taken as
+    ``rank_map.get(b.name, b.behavioral_rank)``. This lets the exact rank
+    allocator (:mod:`fasd.compression.rank_allocator`) override per-branch
+    ranks while preserving the existing aggregation logic.
+    """
+    if rank_map is not None:
+        values = [
+            int(rank_map.get(b.name, b.behavioral_rank))
+            for b in branches if b.kind == kind
+        ]
+    else:
+        values = [int(b.behavioral_rank) for b in branches if b.kind == kind]
     if not values:
         return None
     if reducer == "max":
@@ -79,6 +92,7 @@ def profile_to_student_config(
     min_hidden: int = 64,
     depth_policy: DepthPolicy = "keep",
     depth_keep: int | None = None,
+    rank_map: dict[str, int] | None = None,
 ) -> StudentConfig:
     """Turn a :class:`TeacherProfile` into a compressed student config.
 
@@ -94,7 +108,7 @@ def profile_to_student_config(
         teacher doesn't expose a GQA attribute.
     arch_multiplier
         Scale factor on the retained ranks (default 1.0 — purely
-        profile-driven).
+        profile-driven). Ignored when ``rank_map`` is provided.
     head_multiple
         Round ``hidden_size`` up to this multiple; defaults to the
         teacher's ``num_attention_heads`` so head-dim stays integer.
@@ -107,10 +121,20 @@ def profile_to_student_config(
         middle.
     depth_keep
         Target ``num_hidden_layers`` when ``depth_policy != "keep"``.
+    rank_map
+        Optional dict mapping branch name to per-branch rank, as produced
+        by the exact greedy q/cost knapsack allocator
+        (:func:`fasd.compression.rank_allocator.allocate_ranks`). When
+        provided, the ranks override each branch's stored ``behavioral_rank``
+        and ``arch_multiplier`` is set to 1.0 (the rank-map already encodes
+        the budget; further scaling would corrupt it).
     """
     branches = list(profile.branches if hasattr(profile, "branches") else profile)
     if arch_multiplier <= 0:
         raise ValueError(f"arch_multiplier must be > 0, got {arch_multiplier}")
+    if rank_map is not None:
+        # rank_map already encodes the budget; do not re-scale.
+        arch_multiplier = 1.0
 
     t_hidden = int(getattr(teacher_config, "hidden_size", 0)) or int(
         getattr(teacher_config, "n_embd", 0)
@@ -135,23 +159,26 @@ def profile_to_student_config(
 
     # Residual rank drives hidden_size if we have a residual branch in
     # the profile; otherwise use the max Q/K/V/O rank as a proxy.
-    resid = _branch_rank_by_kind(branches, "block.residual", reducer="max")
+    resid = _branch_rank_by_kind(branches, "block.residual", reducer="max", rank_map=rank_map)
     if resid is None:
         resid = max(
-            _branch_rank_by_kind(branches, "attn.q", reducer="max") or 0,
-            _branch_rank_by_kind(branches, "attn.o", reducer="max") or 0,
-            _branch_rank_by_kind(branches, "ffn.down", reducer="max") or 0,
+            _branch_rank_by_kind(branches, "attn.q", reducer="max", rank_map=rank_map) or 0,
+            _branch_rank_by_kind(branches, "attn.o", reducer="max", rank_map=rank_map) or 0,
+            _branch_rank_by_kind(branches, "ffn.down", reducer="max", rank_map=rank_map) or 0,
         )
     if resid <= 0:
         resid = t_hidden  # unable to determine → keep teacher size
     hidden_size = min(
         t_hidden, _round_up(int(round(resid * arch_multiplier)), head_multiple)
     )
-    hidden_size = max(hidden_size, min_hidden)
+    # Floor at min_hidden, but never exceed the teacher (a compression method must
+    # not inflate). On tiny teachers (hidden < min_hidden) the cap wins, which also
+    # keeps the absorbed bases V_in/V_out valid Stiefel points (n >= k).
+    hidden_size = max(hidden_size, min(min_hidden, t_hidden))
 
     # Intermediate driven by FFN branches.
-    ffn_up = _branch_rank_by_kind(branches, "ffn.up", reducer="max")
-    ffn_gate = _branch_rank_by_kind(branches, "ffn.gate", reducer="max")
+    ffn_up = _branch_rank_by_kind(branches, "ffn.up", reducer="max", rank_map=rank_map)
+    ffn_gate = _branch_rank_by_kind(branches, "ffn.gate", reducer="max", rank_map=rank_map)
     ffn_max = max(ffn_up or 0, ffn_gate or 0)
     if ffn_max <= 0:
         ffn_max = t_interm
@@ -168,8 +195,8 @@ def profile_to_student_config(
 
     # KV heads — drop independently based on K/V branch ranks.
     kv_max = max(
-        _branch_rank_by_kind(branches, "attn.k", reducer="max") or 0,
-        _branch_rank_by_kind(branches, "attn.v", reducer="max") or 0,
+        _branch_rank_by_kind(branches, "attn.k", reducer="max", rank_map=rank_map) or 0,
+        _branch_rank_by_kind(branches, "attn.v", reducer="max", rank_map=rank_map) or 0,
     )
     if kv_max <= 0:
         kv_heads = t_kv_heads
