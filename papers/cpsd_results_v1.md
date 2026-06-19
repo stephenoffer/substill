@@ -92,3 +92,55 @@ seeds, the matched-compression DDR fix, the published baselines (Dobi-SVD/KQ-SVD
 RFID-MoE), and the Llama-3.2 frontier. This is a positive early signal, not a headline claim.
 
 Raw per-cell JSONs: `runs/cpsd_v1/`; summary CSV: `runs/cpsd_v1/summary.csv`.
+
+## Addendum — concrete win vs competition + CPI negative on real GQA (2026-06-18)
+
+**Ladder vs naive baselines (GPT-2, 2×, 500 steps, seed 0):** random+CE 648.4, random+KD 665.5,
+**absorbed-init+KD (F-ASD) 169.5, CPSD-MT 166.4**. Absorbed-init subspace distillation beats
+random-init by **~3.9×** — the concrete win over the competition. CPSD-MT edges frozen F-ASD.
+
+**CPI on real TinyLlama-1.1B (GQA, teacher PPL 10.95), matched architecture, 200 steps:**
+disjoint baseline final **423.4**; CPI ov-align 476.8; CPI cross-plane 494.1; CPI plane-aligned
+607.0. **All CPI variants lose** — at practical compression the student starts far from the
+teacher (init PPL ~65k), so init circuit-fidelity is second-order and per-branch energy capture
+beats circuit preservation. CPI is an honest negative result; the defensible novel win is
+manifold-trained bases over frozen absorbed-init. See docs/cpsd.md for the full tables.
+
+## Measured — head-to-head harness + vision arm (2026-06-18, Anyscale A10G)
+
+**GPT-2 + WikiText-2 head-to-head (`scripts/cpsd_compare.py`, n=3 seeds, 300 steps, teacher 58.90):**
+
+| variant | 4.35× | 7.23× |
+|---|---|---|
+| random-init + KD (naive floor) | 1038 ± 5 | 1171 ± 11 |
+| **F-ASD absorbed-init** | **559 ± 13** | **813 ± 6** |
+| CPSD-MT [novel] | 873 ± 37 | 1217 ± 43 |
+| CPSD-full (MT + KD-driven rank) [novel] | 829 ± 13 | 1237 ± 36 |
+| Dobi-SVD (reconstruction-driven rank) [foil] | 1806 ± 18 | 1794 ± 18 |
+
+- **Win vs naive competition:** absorbed-init 1.4–1.9× better than random-init+KD.
+- **Win vs Dobi-SVD competitor mechanism:** KD-driven rank (CPSD-full) beats reconstruction-driven
+  rank 1.45–2.2× (829 vs 1806; 1237 vs 1794).
+- **Honest negative:** CPSD-MT/full do NOT beat frozen absorbed-init at 300 steps — MT is modest
+  and setting-dependent. Raw: `runs/bench_v1/cmp_v2_*.json`, `cmp_v2_summary.csv`.
+
+**ResNet50 → CIFAR-10 (`scripts/resnet50_distill.py`, teacher top-1 73.6%, 2000 steps):** absorbed-init
+beats random-init at matched compression — width 0.5: **81.1% vs 64.8%** (+16.2pts); width 0.35:
+**78.9% vs 64.7%** (+14.3pts). The vision counterpart of the LLM absorbed-init win.
+
+Code-complete and unit-tested; the *published-SOTA frontier* (Llama-3.2-3B→1B vs Dobi-SVD/KQ-SVD/
+DistiLLM-2/Minitron/RFID-MoE published numbers) remains the decisive run, not yet executed.
+
+Original capability notes:
+
+- **DDR wired end-to-end** (`FSDConfig(use_diff_rank=True)`): KD-driven differentiable rank
+  trains jointly with the manifold factors and folds to a deployable plain-`nn.Linear` student.
+- **Controlled foil for the central claim** (`scripts/cpsd_compare.py`): the matched-compression
+  ladder now includes `cpsd_full` (MT + KD-driven rank) vs `dobi_svd` (the *same* pipeline with
+  the KD term zeroed = Dobi-SVD's reconstruction-driven rank). `scripts/cpsd_aggregate.py` prints
+  the KD-driven-vs-reconstruction-driven verdict per cell. This is the experiment that, when run,
+  tests whether the DDR contribution is real. KQ-SVD/DistiLLM-2/Minitron/RFID-MoE remain deferred
+  (KQ-SVD is a different compression axis; the others cite published numbers).
+- **Vision arm** (`fasd.vision`, `scripts/resnet50_distill.py`): the framework now spans non-LLM
+  CNNs — conv2d absorbed-init narrows ResNet Bottleneck inner channels and `distill_classifier`
+  distils on class logits, giving an absorbed-vs-random matched-compression ladder for ResNet50.

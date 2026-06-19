@@ -1,8 +1,30 @@
 # neural_distill
 
-Compress a PyTorch **LLM** teacher (GPT-2, Llama, Mistral, Qwen) by distilling
-inside its **activation subspace** — the low-dimensional space its features
-actually occupy, rather than channel-for-channel.
+### Shrink a big model into a small, fast one — without starting from scratch.
+
+Big neural networks are expensive to run. `neural_distill` builds a **small "student"
+model that behaves almost like a big "teacher"** by compressing it inside its
+**activation subspace** — the low-dimensional space a trained network actually uses,
+rather than guessing channel-by-channel. The student **starts from the teacher's own
+behavior** instead of random weights, so it reaches good quality with far less training,
+and ships as a plain, fast model with **zero inference overhead**.
+
+**One method, two model families — measured wins over the naive baseline:**
+
+| teacher → student | naive distillation | **FASD (absorbed-init)** | gain |
+|---|---|---|---|
+| GPT-2 / WikiText-2 (≈4.3× smaller) | 1038 perplexity | **559** | **1.9× better** |
+| ResNet-50 / CIFAR-10 (≈2× smaller) | 64.8% accuracy | **81.1%** | **+16 points** |
+
+*New to model distillation or compression?* Start with the plain-language
+**[explainer](docs/explainer.md)** — it explains the idea, why it matters, and what's
+proven, with no prior background assumed.
+
+FASD is a **general** activation-subspace framework: the LLM path covers GPT-2, Llama,
+Mistral, and Qwen decoders, and a **vision path** (`fasd.vision`) covers convolutional
+classifiers such as **ResNet50**. The same machinery — covariance/PCA profiling, the
+absorbed projection `W_s = Vᵀ W V` (now conv2d-aware), basis-invariant feature losses,
+and distillation — applies across both.
 
 The public API is the **`fasd`** package: Functionally-Aligned ASD plus the
 novel **CPSD** pipeline. (`asd` is an internal subpackage providing the
@@ -51,7 +73,8 @@ Key `FSDConfig` fields (all optional, sensible defaults):
 | `rank_map`           | `None`      | explicit per-edge rank overrides                            |
 | `template`           | `"auto"`    | `"gpt2"`, `"llama"`, or `"auto"` (dispatch on teacher class)|
 | `absorbed_init`      | `True`      | initialize student linears with absorbed teacher weights    |
-| `use_cpsd_factored`  | `False`     | replace absorbed linears with Stiefel-trainable factors (CPSD) |
+| `use_cpsd_factored`  | `False`     | replace absorbed linears with Stiefel-trainable factors (CPSD MT) |
+| `use_diff_rank`      | `False`     | KD-driven differentiable rank on the factored edges (CPSD DDR; needs `use_cpsd_factored`) |
 | `use_rr_norm`        | `False`     | swap norms for rotation-equivariant `RRNorm`                |
 | `generative_kd`      | `"skew_kl"` | KD objective: `forward_kl` / `reverse_kl` / `skew_kl`       |
 | `total_steps`, `lr`  | `200`, `5e-5` | distillation budget                                       |
@@ -110,15 +133,57 @@ Subspace Distillation**: the student is initialized with circuit-preserving
 factors (including the OV/value circuit), those factors are trained on the
 Stiefel manifold against the KD loss, and per-edge rank is learned jointly.
 
-**Current status (honest):** on GPT-2 + WikiText-2 (n=5 seeds), CPSD is
-*competitive with* — but does not yet *beat* — the strongest baseline. Manifold
-training helps (both Stiefel-trained variants beat frozen absorbed-init by ~5 PPL),
-but CPSD's extra projection-factor training ties the simpler FSD baseline at this
-scale. GPT-2 cannot exercise CPSD's headline circuit-preserving component (it has no
-GQA/RoPE); on a real GQA+RoPE Llama the OV-circuit basis is a clean win while the
-QK-circuit-under-RoPE benefit is unestablished. The decisive Llama-3.2 frontier
-result is not yet run. See [docs/cpsd.md](docs/cpsd.md) for the mechanism, the full
-results table, and what remains.
+The two trainable components are now both first-class pipeline options:
+
+- **MT (manifold-trained factors):** `use_cpsd_factored=True` swaps absorbed
+  linears for `TeacherFactoredLinear` and the pipeline auto-builds a `StiefelAdam`
+  optimizer so `V_in/V_out` train on the manifold (warm-started from the absorbed
+  bases; `stiefel_lr_ratio`/`stiefel_reorth_every` tune its variance).
+- **DDR (distillation-driven differentiable rank):** `use_diff_rank=True` wraps each
+  factored edge with a soft column gate trained against the **KD loss** under a global
+  parameter budget; `pipe.fold_for_inference()` hardens the gates and folds every edge
+  back to a plain `nn.Linear` (zero inference overhead). The central claim — *KD-driven*
+  rank beating *reconstruction-driven* rank (Dobi-SVD) — is measured directly by
+  `scripts/cpsd_compare.py` as a controlled ablation (same pipeline, KD weight toggled).
+
+**Current status (honest, measured on Anyscale A10G — GPT-2/WikiText-2 n=3, ResNet50/CIFAR-10,
+real TinyLlama-1.1B):**
+
+- **Win vs the naive competition (both modalities):** absorbed-init subspace distillation beats
+  random-init+KD by **1.4–1.9×** PPL on GPT-2 (e.g. 559 vs 1038 at 4.35×, n=3) and by **+14–16
+  top-1 points** on ResNet50/CIFAR-10 (81.1% vs 64.8% at matched compression). The core,
+  reproducible advantage — now spanning LLMs *and* vision.
+- **Win vs a competitor mechanism (Dobi-SVD):** our *KD-driven* differentiable rank beats
+  *reconstruction-driven* rank by **1.45–2.2×** PPL (829 vs 1806 at 4.35×, n=3). The central
+  novelty claim holds directionally and consistently.
+- **Honest negative #1 (manifold training):** at short (300-step) budgets the manifold-trained
+  factors do **not** beat frozen absorbed-init; the MT gain is modest and setting-dependent
+  (~3–4% only at gentler 2–4× / 500 steps, n=5).
+- **Honest negative #2 (CPI):** the circuit-preserving init does **not** beat the disjoint
+  baseline on real GQA — documented as a negative result, not a claim.
+- **Not yet run:** the Llama-3.2-3B→1B frontier vs *published* SOTA numbers
+  (Dobi-SVD/KQ-SVD/DistiLLM-2/Minitron/RFID-MoE) — the decisive head-to-head remains future work.
+
+See [docs/cpsd.md](docs/cpsd.md) for the full tables, mechanism, and what remains.
+
+## Vision — ResNet (non-LLM)
+
+`fasd.vision` applies the same activation-subspace idea to convolutional classifiers.
+A conv is linear in its channels per kernel offset, so the absorbed projection extends to
+2D convs unchanged (`absorbed_init` gained a `"conv2d"` layout). `build_resnet_student`
+narrows each `Bottleneck`'s inner channels (keeping block input/output widths fixed, so
+downsample and the residual add are untouched) and absorbs the teacher's conv weights;
+`distill_classifier` distils on class logits with the same `forward_kl`/`skew_kl` losses.
+
+```python
+from fasd.vision import channel_variance_scores, build_resnet_student, distill_classifier
+scores = channel_variance_scores(teacher, calib_loader)
+student, info = build_resnet_student(teacher, scores, width_ratio=0.5)  # absorbed-init
+distill_classifier(teacher, student, train_loader, val_loader=val_loader)
+```
+
+`scripts/resnet50_distill.py` runs the vision analogue of the GPT-2 ladder (absorbed-init
+vs random-init at matched compression); `--smoke` runs on CPU.
 
 ## How it works
 
@@ -142,6 +207,7 @@ fasd/            current library (public API in fasd/__init__.py)
   losses/          subspace (F_ASDLoss), procrustes, generative KD
   training/        distill driver, Stiefel optimizer, on-policy, re-absorption
   arch/            ArchitectureSpec registry (add a model family declaratively)
+  vision/          non-LLM arm: ResNet channel-narrowing + classifier distillation
 asd/             internal profiling utilities used by fasd (not a public API)
 scripts/         training, ablation, and baseline-reproduction entry points
 docs/            technical docs, project status, history  (see docs/README.md)

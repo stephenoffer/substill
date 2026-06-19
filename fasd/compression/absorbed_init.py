@@ -32,14 +32,17 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-WeightLayout = Literal["linear", "conv1d_gpt2"]
+WeightLayout = Literal["linear", "conv1d_gpt2", "conv2d"]
 
 
 def _infer_layout(module: nn.Module) -> WeightLayout:
-    """Detect whether a module is a standard Linear or HF GPT-2 Conv1D.
+    """Detect whether a module is a Linear, HF GPT-2 Conv1D, or a 2D conv.
 
-    HF Conv1D has a ``nf`` attribute and weight shape ``(d_in, d_out)``.
+    HF Conv1D has a ``nf`` attribute and weight shape ``(d_in, d_out)``;
+    ``nn.Conv2d`` has weight shape ``(out_ch, in_ch, kh, kw)``.
     """
+    if isinstance(module, nn.Conv2d):
+        return "conv2d"
     if hasattr(module, "nf") and not isinstance(module, nn.Linear):
         return "conv1d_gpt2"
     return "linear"
@@ -81,6 +84,17 @@ def absorbed_weight(
             W = V_in.T @ W  # (k_in, d_out)
         if V_out is not None:
             W = W @ V_out  # (k_in, k_out)
+        return W
+    if layout == "conv2d":
+        # W: (out_ch, in_ch, kh, kw). A conv is linear in channels for each kernel
+        # offset (dh, dw), so the absorbed weight is V_out^T W[:,:,dh,dw] V_in applied
+        # across all offsets — exactly the linear case lifted over the spatial kernel.
+        # The kernel size (kh, kw) is preserved; only the channel axes are compressed.
+        W = W_teacher
+        if V_in is not None:
+            W = torch.einsum("oikl,ir->orkl", W, V_in)  # (out_ch, k_in, kh, kw)
+        if V_out is not None:
+            W = torch.einsum("orkl,oc->crkl", W, V_out)  # (k_out, k_in, kh, kw)
         return W
     raise ValueError(f"unknown layout: {layout!r}")
 

@@ -12,7 +12,7 @@ Stages (controlled by ``step_frac``):
 7. Profile refresh on student rollouts.
 8. Quantization-aware final stage.
 
-v0.1 implements all stages; see the plan file for scope.
+All stages are implemented; see the plan file for scope.
 """
 
 from __future__ import annotations
@@ -142,6 +142,8 @@ def distill(
     total_steps: int = 200,
     lr: float = 5e-5,
     optimizer=None,
+    rank_controller=None,
+    rank_anneal: float = 0.97,
     grad_clip: float | None = 1.0,
     log_every: int = 50,
     loss_objective: str = "procrustes",
@@ -367,6 +369,12 @@ def distill(
             + delta * kd_loss + contrastive_weight * contr_loss
         )
 
+        # DDR: add the global parameter-budget penalty on the soft column gates.
+        budget_loss = torch.zeros((), device=device)
+        if rank_controller is not None:
+            budget_loss = rank_controller.budget_penalty().to(total.dtype)
+            total = total + budget_loss
+
         # NaN / Inf guard: halve LR on first trip; abort the rung on a second
         # consecutive trip rather than continuing to spin at a degenerate state.
         if not torch.isfinite(total):
@@ -523,6 +531,16 @@ def distill(
             except Exception as e:
                 history.append({"stage": "reabsorb_failed", "step": step, "error": str(e)})
                 print(f"[fasd.distill] reabsorb failed at step {step}: {e}", flush=True)
+
+        # DDR: anneal the gate temperature toward 0 (sharpen soft gates to {0,1}) on a
+        # coarse cadence, and log the soft rank budget so its convergence is visible.
+        if rank_controller is not None and step > 0 and step % eval_every == 0:
+            rank_controller.anneal_temperature(rank_anneal)
+            history.append({
+                "stage": "diff_rank", "step": step,
+                "expected_params": float(rank_controller.expected_params().item()),
+                "budget_loss": float(budget_loss.detach().item()),
+            })
 
         if val_loader is not None and step > 0 and step % eval_every == 0:
             ppl = _eval_ppl(student, val_loader, device)

@@ -1,74 +1,26 @@
-"""FactoredLinear: trainable U_in, U_out, B, S factors (HANDOFF TODO #4 module).
+"""Stiefel-trainable factored linears for CPSD manifold training (MT).
 
-**Status note (2026-05-02)**: This module is *implemented and tested in
-isolation* (15 tests in test_fsd_factored_linear.py pass) but is **not yet
-integrated into the absorbed-init builder pipeline**. A naive drop-in
-replacement of the student's `nn.Linear` modules failed because the forward
-chain ``(x @ U_in) @ B^T @ U_out^T`` expects teacher-dim input ``d_in``,
-while the absorbed-init student's input has already been compressed to
-``k_in``. Two architecturally-different paths to actually use FactoredLinear
-in training:
+This module provides two classes:
 
-  (a) **Uncompressed student** — replace the student's compressed linears
-      with FactoredLinear(d_in=t_d_in, d_out=t_d_out, k_in=s_k_in, k_out=s_k_out).
-      The student now has the same input/output dimensions as the teacher
-      but with rank-bottlenecked weights. Loses the parameter-count savings
-      of compression unless followed by a dimensionality projection layer.
+- :class:`TeacherFactoredLinear` — the **production CPSD-MT module**. It replaces an
+  absorbed-init student linear with a frozen teacher weight ``W_T`` plus trainable
+  Stiefel bases ``V_in/V_out`` (collapsed weight ``W_S = V_out^T W_T V_in``), optionally
+  a zero-initialized Euclidean ``B_free`` core for extra fitting capacity. It operates on
+  the *student-dim* residual stream (unlike :class:`FactoredLinear`, whose ``U_in`` consumes
+  teacher-dim input), so it drops directly into a compressed student. It is wired into the
+  pipeline by ``FSDPipeline(use_cpsd_factored=True)`` via ``convert_{gpt2,llama}_to_factored``
+  and folds to a plain ``nn.Linear`` for zero-overhead inference (:meth:`TeacherFactoredLinear.fold`).
+  :class:`GatedFactoredLinear` wraps it with a :class:`DifferentiableRankGate` for DDR.
 
-  (b) **Feature-loss-only** — keep the student's compressed linears as plain
-      nn.Linear, store U_in/U_out as side parameters on each module. They're
-      trained by an auxiliary feature-distillation loss
-      ``L_feat = ||U_out^T t_hidden - s_hidden||²`` where t_hidden is the
-      teacher's full-dim activation and s_hidden is the student's compressed
-      activation. The trainable U_in, U_out parameterize the teacher↔student
-      subspace correspondence; they don't participate in the linear forward.
+- :class:`FactoredLinear` — a general ``U_out @ B @ U_in^T`` factorization (teacher-dim I/O,
+  rank-bottlenecked core) used for research/toy experiments and as the ``from_teacher``
+  reference factorization. It is not the module the pipeline swaps in.
 
-Both options require non-trivial restructuring of the trainer. This is
-documented in HANDOFF.md as deferred to user implementation.
-
-**The module itself remains useful**:
-  - As a building block for future architectures.
-  - As a convenient entry point for experimenting with Stiefel-trainable
-    bases on small toy problems.
-  - The from_teacher constructor produces a mathematically-correct
-    factorization that's verified by the test suite.
-
-Pillar 2 (trainable Stiefel bases) requires that V_in and V_out — the input/
-output bases of the absorbed-init weight ``W_S = V_out^T W_T V_in`` — are
-*standalone* `nn.Parameter` matrices, so the StiefelAdam optimizer can find
-them and keep them on the manifold during training.
-
-The current absorbed-init code in [fasd/builders.py](../builders.py) writes
-``V_out^T W_T V_in`` into a plain `nn.Linear.weight`, which collapses the three
-factors into one. After the absorb step, V_in and V_out are *unrecoverable*
-from the linear's weight — they're not stored anywhere. The RR-Norm Q matrix
-(in fasd/util/rr_norm.py) IS already a trainable Stiefel parameter — that's
-what the headline experiment uses for Pillar 2. Wiring V_in/V_out as well
-needs option (a) or (b) above.
-
-This module provides::
-
-    class FactoredLinear(nn.Module):
-        weight_effective = U_out @ B @ U_in.T + S
-
-where:
-    U_in  ∈ R^{d_in × k_in}   trainable on Stiefel manifold
-    U_out ∈ R^{d_out × k_out} trainable on Stiefel manifold
-    B     ∈ R^{k_out × k_in}  trainable on Euclidean (the small core)
-    S     ∈ optional sparse-block correction (Pillar 3)
-
-The forward pass computes ``y = x @ weight_effective.T + b``. To avoid
-materialising the full weight on every forward (which would defeat the
-compression benefit when k_in ≪ d_in), we evaluate via the small-matrix
-chain::
-
-    y = ((x @ U_in) @ B.T) @ U_out.T + b
-
-This is O(B · T · d_in · k_in + B · T · k_in · k_out + B · T · k_out · d_out).
-
-Markers ``is_stiefel_q = True`` on U_in and U_out tell `stiefel_param_groups`
-to register them in the Stiefel param-group; B and the bias go into the
-Euclidean group.
+Both keep ``V_in``/``V_out`` (resp. ``U_in``/``U_out``) as standalone Stiefel ``nn.Parameter``
+matrices tagged ``is_stiefel = True`` so :func:`fasd.training.stiefel_optim.stiefel_param_groups`
+places them in the Stiefel group (the Euclidean core ``B``/``B_free`` and bias go in the AdamW
+group). Forwards evaluate via the small-matrix chain (no full-weight materialization), e.g.
+``y = ((x @ U_in) @ B.T) @ U_out.T + b`` — O(B·T·(d_in·k_in + k_in·k_out + k_out·d_out)).
 """
 
 from __future__ import annotations
@@ -77,6 +29,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from .diff_rank import DifferentiableRankGate
 from .sparse_block import BlockDiagonalCorrection
 
 
@@ -400,7 +353,7 @@ class TeacherFactoredLinear(nn.Module):
         for the conv1d layout the effective weight is ``(k_in, k_out)`` so it is
         transposed. The sparse-block correction (square case) is folded in.
         """
-        lin = nn.Linear(self.k_in, self.k_out, bias=self.b_T is not None)
+        lin = nn.Linear(self.k_in, self.k_out, bias=self.b_T is not None).to(self.V_in.device)
         # linear: (k_out, k_in); conv1d: (k_in, k_out)
         W = self.effective_weight()
         W_lin = W if self.layout == "linear" else W.T    # -> (k_out, k_in)
@@ -414,6 +367,100 @@ class TeacherFactoredLinear(nn.Module):
         b = self.effective_bias()
         if b is not None:
             lin.bias.data.copy_(b.to(lin.bias.dtype))
+        return lin
+
+
+class GatedFactoredLinear(nn.Module):
+    """A :class:`TeacherFactoredLinear` with a :class:`DifferentiableRankGate` on its
+    compressed input latent — the CPSD manifold-training (MT) + distillation-driven
+    differentiable-rank (DDR) module combined into one trainable edge.
+
+    Forward applies the soft gate to ``x`` (the ``k_in`` latent) before routing it
+    through the frozen teacher weight::
+
+        y = tfl(gate(x))            # gate scales each of the k_in latent columns
+
+    The gate's per-column keep-probabilities are trained against the KD loss under a
+    global parameter budget (a :class:`RankBudgetController` holds the gates + costs).
+    Because the gate multiplies the *input* latent, it folds exactly into the collapsed
+    weight by scaling its columns — so inference is a single plain ``nn.Linear`` with
+    zero gate overhead (see :meth:`fold`). The Stiefel bases ``V_in/V_out`` of the inner
+    ``tfl`` remain manifold-trained (discovered via the inner module's
+    ``stiefel_parameters()``); the gate ``alpha`` trains in the Euclidean group.
+
+    This promotes the proven ``GatedCPSDLinear`` pattern from
+    ``tests/test_fsd_cpsd_integration.py`` to a reusable, pipeline-wired module.
+
+    Parameters
+    ----------
+    tfl : TeacherFactoredLinear
+        The factored edge to gate.
+    init_open : bool
+        Start with all gates ≈ open (the absorbed-init full-rank edge); DDR then
+        prunes columns down to the budget.
+    temperature : float
+        Initial sigmoid temperature; annealed toward ``0`` to sharpen to {0, 1}.
+    monotone : bool
+        Enforce a contiguous top-prefix rank (bases are ordered by importance).
+    """
+
+    def __init__(
+        self,
+        tfl: "TeacherFactoredLinear",
+        *,
+        init_open: bool = True,
+        temperature: float = 1.0,
+        monotone: bool = False,
+    ):
+        super().__init__()
+        self.tfl = tfl
+        self.gate = DifferentiableRankGate(
+            tfl.k_in, init_open=init_open, temperature=temperature, monotone=monotone
+        )
+
+    @property
+    def k_in(self) -> int:
+        return self.tfl.k_in
+
+    @property
+    def k_out(self) -> int:
+        return self.tfl.k_out
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.tfl(self.gate(x))
+
+    def cost(self) -> Tensor:
+        """Per-column parameter cost (``d_in + d_out`` for each of the ``k_in`` columns)."""
+        return torch.full(
+            (self.tfl.k_in,), float(self.tfl.d_in + self.tfl.d_out)
+        )
+
+    def stiefel_parameters(self) -> list[nn.Parameter]:
+        """Delegate to the inner factored linear (the gate is Euclidean, not Stiefel)."""
+        return self.tfl.stiefel_parameters()
+
+    def gate_parameters(self) -> list[nn.Parameter]:
+        return list(self.gate.parameters())
+
+    def expected_rank(self) -> Tensor:
+        return self.gate.expected_rank()
+
+    @torch.no_grad()
+    def fold(self, *, harden: bool = True, threshold: float = 0.5) -> nn.Linear:
+        """Collapse to a plain ``nn.Linear(k_in, k_out)`` with the gate folded in.
+
+        Gating the input latent scales the columns of the collapsed weight, so we fold
+        the inner ``tfl`` and multiply column ``j`` by gate value ``g_j``. With
+        ``harden=True`` the gate is binarized at ``threshold`` (columns below it become
+        exact zeros — the realized rank reduction); otherwise the soft gate is used.
+        Bias is unaffected (the gate only scales ``x``).
+        """
+        lin = self.tfl.fold()  # nn.Linear(k_in, k_out), weight (k_out, k_in)
+        g = self.gate.gate()
+        if harden:
+            g = (g >= threshold).to(g.dtype)
+        g = g.to(device=lin.weight.device, dtype=lin.weight.dtype)
+        lin.weight.data.mul_(g[None, :])  # scale input columns
         return lin
 
 
@@ -435,4 +482,5 @@ def stiefel_parameters_of(module: nn.Module) -> list[nn.Parameter]:
     return out
 
 
-__all__ = ["FactoredLinear", "TeacherFactoredLinear", "stiefel_parameters_of"]
+__all__ = ["FactoredLinear", "TeacherFactoredLinear", "GatedFactoredLinear",
+           "stiefel_parameters_of"]

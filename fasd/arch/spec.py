@@ -22,7 +22,9 @@ from typing import Literal
 
 import torch.nn as nn
 
-WeightLayout = Literal["linear", "conv1d_gpt2"]
+# Keep in sync with fasd.compression.absorbed_init.WeightLayout ("conv2d" added for the
+# vision/ResNet path).
+WeightLayout = Literal["linear", "conv1d_gpt2", "conv2d"]
 AttnLayout = Literal["separate_qkv", "fused_qkv"]
 
 

@@ -9,6 +9,7 @@ overview. This directory holds the technical docs.
 
 | file                                               | what it is                                            |
 |----------------------------------------------------|-------------------------------------------------------|
+| [explainer.md](explainer.md)                       | **Start here if you're new** — plain-language walkthrough: the idea, why it matters, what's proven (no background assumed) |
 | [cpsd.md](cpsd.md)                                 | CPSD (Circuit-Preserving Subspace Distillation) — the novel system behind `FSDPipeline` |
 | [adding_architectures.md](adding_architectures.md) | Checklist for supporting a new model family via `ArchitectureSpec` |
 | [fasd/quickstart.md](fasd/quickstart.md)           | F-ASD library walkthrough                             |

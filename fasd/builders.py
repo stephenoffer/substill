@@ -23,6 +23,7 @@ the student's config.
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 import torch
@@ -165,6 +166,18 @@ def _pad_cols_orthogonal(V: Tensor, cols_needed: int) -> Tensor:
     return torch.cat([V, Q[:, :extra]], dim=1).contiguous()
 
 
+def _pad_rows_to(V: Tensor, rows: int) -> Tensor:
+    """Pad/truncate ``V`` to ``rows`` rows (zero-pad below, slice above). Used to lift a
+    behavioral-rank basis back to the full teacher dimension. Shared by the GPT-2 and
+    Llama absorb paths (replaces three near-identical local copies)."""
+    if V.shape[0] == rows:
+        return V
+    if V.shape[0] > rows:
+        return V[:rows].contiguous()
+    pad = torch.zeros(rows - V.shape[0], V.shape[1], dtype=V.dtype)
+    return torch.cat([V, pad], dim=0)
+
+
 # -- GPT-2 -------------------------------------------------------------
 
 
@@ -199,15 +212,6 @@ def _build_gpt2(teacher, profile, student_cfg: StudentConfig, absorbed_init: boo
     return _gpt2_absorb(teacher, student, profile)
 
 
-def _gpt2_pad_rows(V: Tensor, rows: int) -> Tensor:
-    if V.shape[0] == rows:
-        return V
-    if V.shape[0] > rows:
-        return V[:rows].contiguous()
-    pad = torch.zeros(rows - V.shape[0], V.shape[1], dtype=V.dtype)
-    return torch.cat([V, pad], dim=0)
-
-
 def gpt2_absorb_targets(teacher, student, profile):
     """Yield ``(name, t_module, s_module, V_in, V_out)`` for every absorbed weight.
 
@@ -230,13 +234,13 @@ def gpt2_absorb_targets(teacher, student, profile):
     s_interm = int(student.config.n_inner or 4 * s_hidden)
 
     V_r = _residual_basis(profile, t_hidden, s_hidden)
-    V_r_full = _gpt2_pad_rows(V_r, t_hidden)
+    V_r_full = _pad_rows_to(V_r, t_hidden)
     V_qkv = torch.block_diag(V_r_full, V_r_full, V_r_full)
 
     for i, s_block in enumerate(s_h):
         t_block = t_h[i]
         prefix = f"transformer.h.{i}"
-        V_up = _gpt2_pad_rows(
+        V_up = _pad_rows_to(
             _channel_select_basis(profile, f"{prefix}.ffn.up", s_interm), t_interm
         )
         yield (f"{prefix}.attn.c_attn", t_block.attn.c_attn, s_block.attn.c_attn, V_r_full, V_qkv)
@@ -306,8 +310,6 @@ def _col_basis(profile, branch_name: str, cols_needed: int) -> Tensor:
             V = b.principal_components.float()
             if cols_needed <= V.shape[1]:
                 return V[:, :cols_needed].contiguous()
-            import warnings
-
             warnings.warn(
                 f"_col_basis({branch_name!r}, cols_needed={cols_needed}) > "
                 f"channels={V.shape[1]}; falling back to random-orthogonal padding. "
@@ -400,22 +402,14 @@ def _build_llama(teacher, profile, student_cfg: StudentConfig, absorbed_init: bo
         V_up = _channel_select_basis(profile, f"{prefix}.ffn.up", s_interm)
 
         # Pad bases out to the full teacher dim if needed (eigh returns C x C,
-        # but _col_basis may truncate).
-        def _pad_rows(V, rows):
-            if V.shape[0] == rows:
-                return V
-            if V.shape[0] > rows:
-                return V[:rows]
-            pad = torch.zeros(rows - V.shape[0], V.shape[1], dtype=V.dtype)
-            return torch.cat([V, pad], dim=0)
-
+        # but _col_basis may truncate) — see module-level _pad_rows_to.
         kv_rows = int(
             getattr(t_cfg, "num_key_value_heads", t_cfg.num_attention_heads)
         ) * (t_hidden_int // int(t_cfg.num_attention_heads))
-        V_r_full = _pad_rows(V_r, t_hidden_int)
-        V_k_full = _pad_rows(V_k, kv_rows)
-        V_v_full = _pad_rows(V_v, kv_rows)
-        V_up_full = _pad_rows(V_up, t_interm_int)
+        V_r_full = _pad_rows_to(V_r, t_hidden_int)
+        V_k_full = _pad_rows_to(V_k, kv_rows)
+        V_v_full = _pad_rows_to(V_v, kv_rows)
+        V_up_full = _pad_rows_to(V_up, t_interm_int)
 
         # Mirror the GPT-2 fix: for non-GQA, q/k/v share V_r_full so Q·K^T is
         # preserved across the projection. GQA (num_kv_heads < num_attention_heads)
@@ -475,23 +469,16 @@ def llama_absorb_targets(teacher, student, profile):
 
     V_r = _residual_basis(profile, t_hidden, s_hidden)
 
-    def _pad_rows(V, rows):
-        if V.shape[0] == rows:
-            return V
-        if V.shape[0] > rows:
-            return V[:rows]
-        return torch.cat([V, torch.zeros(rows - V.shape[0], V.shape[1], dtype=V.dtype)], dim=0)
-
-    V_r_full = _pad_rows(V_r, t_hidden)
+    V_r_full = _pad_rows_to(V_r, t_hidden)
     is_gqa = s_kv_out != s_hidden
     t_layers, s_layers = teacher.model.layers, student.model.layers
     for i, s_block in enumerate(s_layers):
         t_block = t_layers[i]
         prefix = f"model.layers.{i}"
-        V_k = _pad_rows(_col_basis(profile, f"{prefix}.attn.k", s_kv_out), t_kv)
-        V_v = _pad_rows(_col_basis(profile, f"{prefix}.attn.v", s_kv_out), t_kv)
+        V_k = _pad_rows_to(_col_basis(profile, f"{prefix}.attn.k", s_kv_out), t_kv)
+        V_v = _pad_rows_to(_col_basis(profile, f"{prefix}.attn.v", s_kv_out), t_kv)
         V_gate = _channel_select_basis(profile, f"{prefix}.ffn.gate", s_interm)
-        V_up = _pad_rows(_channel_select_basis(profile, f"{prefix}.ffn.up", s_interm), t_interm)
+        V_up = _pad_rows_to(_channel_select_basis(profile, f"{prefix}.ffn.up", s_interm), t_interm)
         kv_out = (V_k, V_v) if is_gqa else (V_r_full, V_r_full)
         attn, s_attn = t_block.self_attn, s_block.self_attn
         mlp, s_mlp = t_block.mlp, s_block.mlp
