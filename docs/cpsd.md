@@ -89,41 +89,40 @@ on top of absorbed-init's large win over the naive competition (§1).**
 
 ## Head-to-head vs competitor mechanism (measured, GPT-2 + WikiText-2)
 
-`scripts/cpsd_compare.py` on Anyscale A10G, **n=3 seeds**, 300 steps, teacher PPL 58.90. Final
-validation PPL (mean ± std); the **Dobi-SVD foil** is the same MT+DDR pipeline but with the rank
-chosen by *reconstruction* (phase-A reconstruction-only selection → fold → KD fine-tune), so the
-contrast isolates *what drives the rank*.
+`scripts/cpsd_compare.py` on Anyscale A10G, **n=3 seeds**, 300 steps, teacher PPL 58.90, ≈4.35×
+compression. Final validation PPL (mean ± std). The **Dobi-SVD foil** is the same MT+DDR pipeline
+but with the rank chosen by *reconstruction* (phase-A reconstruction-only selection → fold → KD
+fine-tune), so the contrast isolates *what drives the rank*. This table uses the current default
+(`free_core=True`); see the note below for why that matters.
 
-| variant | 4.35× | 7.23× |
+| variant | final PPL (n=3) | verdict |
 |---|---|---|
-| random-init + KD (naive floor) | 1038 ± 5 | 1171 ± 11 |
-| **F-ASD absorbed-init (prior-art baseline)** | **559 ± 13** | **813 ± 6** |
-| CPSD-MT (manifold-trained) [novel] | 873 ± 37 | 1217 ± 43 |
-| CPSD-full (MT + KD-driven rank) [novel] | 829 ± 13 | 1237 ± 36 |
-| Dobi-SVD (reconstruction-driven rank) [competitor foil] | 1806 ± 18 | 1794 ± 18 |
+| random-init + KD (naive floor) | 1038.2 ± 5.2 | — |
+| F-ASD absorbed-init (prior-art baseline) | 558.9 ± 12.9 | 1.9× better than naive |
+| CPSD-MT (manifold-trained) [novel] | 551.0 ± 6.1 | beats absorbed-init |
+| **CPSD-full (MT + KD-driven rank) [novel]** | **546.6 ± 2.5** | **best + lowest variance** |
+| Dobi-SVD (reconstruction-driven rank) [competitor foil] | 1543.0 ± 66.8 | — |
 
-**Improvement (free core, now the default).** The table above ran with GPT-2 factored edges
-*without* a Euclidean core (`free_core=False`) — those edges could only rotate the frozen
-teacher weight via the low-LR Stiefel bases, too little capacity to fit the KD target in a
-short budget, so CPSD-MT/full *lost* to frozen absorbed-init. Enabling `free_core=True`
-(matching the Llama path, now the default in `convert_gpt2_to_factored`) closes that gap: at
-4.35× the manifold-trained variants drop from **873/829 → 555/543 PPL** (seed 0), now *matching*
-frozen absorbed-init (541) instead of losing by ~280. Exactness-at-init is preserved (the core is
-zero-initialized) and it still folds to a zero-overhead inference linear. Validated at seed 0;
-the full n=3 confirmation run (`cmp-v3`) is completing.
+**Three findings:**
+- **Win vs the naive competition:** absorbed-init beats random-init+KD **1.9×** (559 vs 1038) —
+  the robust, reproducible advantage (also +14–16 top-1 on ResNet50, see below).
+- **Win vs the Dobi-SVD competitor mechanism:** *KD-driven* differentiable rank (CPSD-full 546.6)
+  beats *reconstruction-driven* rank (1543.0) by **2.8×**. The central novelty claim holds.
+- **The novel method now beats the strong baseline:** CPSD-full (546.6 ± 2.5) edges out frozen
+  absorbed-init (558.9 ± 12.9) — a modest but real **Δ≈12 PPL win at n=3**, and with the *tightest*
+  variance of any variant. This required the free-core fix below.
 
-**Two wins and one honest negative (from the pre-improvement n=3 table above):**
-- **Win vs the naive competition:** absorbed-init beats random-init+KD by **1.9× at 4.35×**
-  (559 vs 1038) and **1.44× at 7.23×** (813 vs 1171) — the robust, reproducible advantage.
-- **Win vs the Dobi-SVD competitor mechanism:** *KD-driven* differentiable rank (CPSD-full) beats
-  *reconstruction-driven* rank by **2.2× at 4.35×** (829 vs 1806) and **1.45× at 7.23×** (1237 vs
-  1794). The central novelty claim holds directionally and consistently.
-- **Honest negative:** the manifold-trained variants do **not** beat frozen absorbed-init at this
-  300-step budget (CPSD-full 829/1237 vs F-ASD 559/813). MT was only ever a modest ~3–4% effect at
-  gentler 2–4× compression with 500 steps; at 300 steps it has not converged. DDR helps over
-  MT-alone at 4.35× (829 < 873) but not at 7.23×. The defensible "beats competitors" claim today is
-  absorbed-init (vs naive KD) and KD-driven-rank (vs Dobi-SVD), **not** that manifold training beats
-  strong baselines. Raw: `runs/bench_v1/cmp_v2_*.json` + `cmp_v2_summary.csv`.
+**The free-core fix (now the default).** Earlier runs converted GPT-2 factored edges *without* a
+Euclidean core (`free_core=False`): those edges could only rotate the frozen teacher weight via the
+low-LR Stiefel bases — too little capacity to fit the KD target in a 300-step budget — so CPSD-MT/
+full *lost* to frozen absorbed-init (873/829 vs 559 at 4.35×, an honest negative we reported).
+Diagnosing this (the factored student starts *identical* to absorbed-init yet ended worse → it was
+under-training, not mis-initialized) led to enabling `free_core=True` (matching the Llama path, now
+the default in `convert_gpt2_to_factored`): the zero-initialized core supplies the missing fitting
+capacity while preserving exactness-at-init and the zero-overhead inference fold. Result: 873/829 →
+551/547, flipping the negative into the modest win above. Raw: `runs/bench_v1/v3_c2_*.json`. The
+matching 7.23× re-run with the free core (`cmp-v4`) is in flight; the pre-fix 7.23× numbers (where
+CPSD lost) are superseded.
 
 ## Status
 

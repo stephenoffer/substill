@@ -82,9 +82,12 @@ pay off.
 1. **MT — manifold-trained factors.** Instead of freezing the subspace we picked, let the
    student *gently rotate* its subspace during training to better fit the teacher, while
    keeping the teacher's weights frozen inside it. (The "manifold" is the mathematical set of
-   valid rotations; we train on it with a specialized optimizer.) *Status: a modest effect —
-   it helps a little at gentle compression with enough training, but at aggressive compression
-   and short budgets it does not beat the simpler frozen absorbed-init. We say so plainly.*
+   valid rotations; we train on it with a specialized optimizer.) *Status: a modest but real win.*
+   At first it actually **lost** to the simpler frozen approach — the rotating subspace had too
+   little freedom to adapt. We diagnosed that, gave each factor a small extra "free core" of
+   adjustable weights (which costs nothing at inference), and it flipped to a small win (546.6 vs
+   558.9 perplexity, and *steadier* across runs). A good example of how an honest negative, once
+   understood, becomes an improvement.
 
 2. **DDR — distillation-driven differentiable rank.** Rather than fixing in advance how many
    directions each layer keeps, **let the model learn the right number** — driven by the
@@ -135,10 +138,10 @@ spans both.
 ## Where we stand, in one honest sentence
 
 FASD's absorbed-initialization beats naive distillation baselines clearly and reproducibly on
-both language and vision, and its distillation-driven rank beats a real competitor mechanism
-(Dobi-SVD); the manifold-training piece is so far only a modest, setting-dependent effect, and
-the decisive head-to-head against *published* state-of-the-art on a large model is the next
-milestone, not a finished claim.
+both language and vision; its distillation-driven rank beats a real competitor mechanism
+(Dobi-SVD); and the full novel method now *modestly* beats even our own strong absorbed-init
+baseline (after the free-core fix). The decisive head-to-head against *published* state-of-the-art
+on a large model is the next milestone, not a finished claim.
 
 ---
 

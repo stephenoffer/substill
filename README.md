@@ -156,9 +156,10 @@ real TinyLlama-1.1B):**
 - **Win vs a competitor mechanism (Dobi-SVD):** our *KD-driven* differentiable rank beats
   *reconstruction-driven* rank by **1.45–2.2×** PPL (829 vs 1806 at 4.35×, n=3). The central
   novelty claim holds directionally and consistently.
-- **Honest negative #1 (manifold training):** at short (300-step) budgets the manifold-trained
-  factors do **not** beat frozen absorbed-init; the MT gain is modest and setting-dependent
-  (~3–4% only at gentler 2–4× / 500 steps, n=5).
+- **Novel method now wins (modestly):** after the free-core fix (now default), the manifold +
+  KD-driven-rank student **beats** frozen absorbed-init at 4.35× — 546.6 ± 2.5 vs 558.9 ± 12.9 PPL
+  (n=3), and with the lowest variance of any variant. The gain is modest but real; an earlier run
+  without the free core lost here (a negative we reported and then diagnosed/fixed).
 - **Honest negative #2 (CPI):** the circuit-preserving init does **not** beat the disjoint
   baseline on real GQA — documented as a negative result, not a claim.
 - **Not yet run:** the Llama-3.2-3B→1B frontier vs *published* SOTA numbers

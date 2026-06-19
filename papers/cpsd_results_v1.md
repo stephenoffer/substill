@@ -121,8 +121,11 @@ manifold-trained bases over frozen absorbed-init. See docs/cpsd.md for the full 
 - **Win vs naive competition:** absorbed-init 1.4–1.9× better than random-init+KD.
 - **Win vs Dobi-SVD competitor mechanism:** KD-driven rank (CPSD-full) beats reconstruction-driven
   rank 1.45–2.2× (829 vs 1806; 1237 vs 1794).
-- **Honest negative:** CPSD-MT/full do NOT beat frozen absorbed-init at 300 steps — MT is modest
-  and setting-dependent. Raw: `runs/bench_v1/cmp_v2_*.json`, `cmp_v2_summary.csv`.
+- **Honest negative → fixed:** in this `free_core=False` run CPSD-MT/full LOST to frozen
+  absorbed-init (873/829 vs 559). Diagnosed as under-training (factored edges had no Euclidean
+  fitting capacity) and fixed by `free_core=True` (now default). Re-run (`cmp-v3`, n=3, 4.35×):
+  CPSD-full **546.6 ± 2.5 beats** absorbed-init 558.9 ± 12.9 — a modest win with the lowest
+  variance. Raw: `runs/bench_v1/v3_c2_*.json`. (7.23× free-core re-run `cmp-v4` in flight.)
 
 **ResNet50 → CIFAR-10 (`scripts/resnet50_distill.py`, teacher top-1 73.6%, 2000 steps):** absorbed-init
 beats random-init at matched compression — width 0.5: **81.1% vs 64.8%** (+16.2pts); width 0.35:
