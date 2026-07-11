@@ -1,5 +1,23 @@
 # CPSD — Circuit-Preserving Subspace Distillation
 
+> **The numbers in this document are unverified and partly invalidated.**
+> See **[init_findings.md](init_findings.md)**. Two problems affect every table below:
+>
+> 1. **The residual basis was never the profiled subspace.** `profile()` defaults to
+>    `mode="branch"`, which emits no `block.residual` branch, so `_residual_basis`
+>    silently returned `torch.eye(d, k)` — truncation to the first `k` coordinates.
+>    Every "absorbed-init" and CPSD student in these tables was built that way.
+>    (`fasd/compression/cpi.py` hits the same fallback.)
+> 2. **300 steps at one learning rate.** Every arm's optimum is near `lr=1e-3`; at the
+>    defaults used here the ranking of two arms inverts, and all students are far from
+>    converged (PPL 500–1000 against a teacher at 50.9), so the tables largely measure
+>    early-training speed.
+>
+> A compute-matched, tuned-LR, 3-seed rerun at 4.15× found plain absorbed init + forward
+> KL (161.0 ± 1.9 PPL) beating every added mechanism, and found *initialization fidelity
+> to be anti-correlated with post-distillation quality*. The Δ≈12 PPL "novel method wins"
+> result in §"Head-to-head" has not been reproduced. Re-run before citing.
+
 CPSD is the novel contribution layered onto the FASD/FSD codebase. It is the **first
 method to train circuit-preserving low-rank compression factors end-to-end against a
 distillation objective, with the per-edge rank learned jointly with that objective.**
@@ -24,7 +42,7 @@ preprint-rewrite guidance live in `papers/`:
    jointly with the manifold-trained factors, then `FSDPipeline.fold_for_inference()`
    hardens them and folds every edge to a plain `nn.Linear`. Its defining contrast with
    Dobi-SVD (KD-driven vs reconstruction-driven rank) is measured by a controlled ablation
-   in `scripts/cpsd_compare.py`.
+   in `scripts/cpsd/cpsd_compare.py`.
 
 ## Usage
 
@@ -70,7 +88,7 @@ RR-Norm-Q at GPT-2 scale (so the modest win is "manifold training helps", not "C
 ### 3. Honest negative: CPI does NOT beat the disjoint baseline on real GQA
 
 GPT-2 has no GQA/RoPE, so it cannot test CPI. On **real TinyLlama-1.1B (GQA, teacher PPL 10.95)**,
-the matched-architecture comparison (`scripts/cpsd_cpi_init_eval.py`) is:
+the matched-architecture comparison (`scripts/cpsd/cpsd_cpi_init_eval.py`) is:
 
 | attention init | init PPL | final PPL (200 steps) |
 |---|---|---|
@@ -89,7 +107,7 @@ on top of absorbed-init's large win over the naive competition (§1).**
 
 ## Head-to-head vs competitor mechanism (measured, GPT-2 + WikiText-2)
 
-`scripts/cpsd_compare.py` on Anyscale A10G, **n=3 seeds**, 300 steps, teacher PPL 58.90, ≈4.35×
+`scripts/cpsd/cpsd_compare.py` on Anyscale A10G, **n=3 seeds**, 300 steps, teacher PPL 58.90, ≈4.35×
 compression. Final validation PPL (mean ± std). The **Dobi-SVD foil** is the same MT+DDR pipeline
 but with the rank chosen by *reconstruction* (phase-A reconstruction-only selection → fold → KD
 fine-tune), so the contrast isolates *what drives the rank*. This table uses the current default
@@ -145,10 +163,10 @@ CPSD lost) are superseded.
 - **Now built (code + unit tests; head-to-head numbers gated on compute):**
   - **DDR wired end-to-end** (`use_diff_rank`): KD-driven differentiable rank trains jointly
     with the manifold factors and folds to a deployable plain-`nn.Linear` student.
-  - **Controlled foil for the central claim** (`scripts/cpsd_compare.py`): the *same* MT+DDR
+  - **Controlled foil for the central claim** (`scripts/cpsd/cpsd_compare.py`): the *same* MT+DDR
     pipeline with the KD term zeroed reproduces **Dobi-SVD's reconstruction-driven rank**, so
     the matched comparison isolates "KD-driven vs reconstruction-driven rank". The aggregator
-    (`scripts/cpsd_aggregate.py`) prints the per-cell verdict.
+    (`scripts/cpsd/cpsd_aggregate.py`) prints the per-cell verdict.
   - **Vision arm** (`fasd.vision`, see below): the framework now spans non-LLM CNNs (ResNet).
 - **Remaining / deferred:** the GPT-2/WikiText-2 ladder and Llama-3.2-3B→1B ≥3-seed frontier
   runs (harness ready, compute-gated); empirical confirmation of the MT seed-variance knobs;
@@ -167,7 +185,7 @@ independently (the convolutional analogue of compressing a transformer FFN's int
 dim). Channel *selection* (not PCA rotation) is used because a BN+ReLU sits between the
 convs and ReLU does not commute with a basis rotation; at full width the student reproduces
 the teacher bit-for-bit. `build_resnet_student` + `distill_classifier` (class-logit KD via
-the same `forward_kl`/`skew_kl`) provide the end-to-end path; `scripts/resnet50_distill.py`
+the same `forward_kl`/`skew_kl`) provide the end-to-end path; `scripts/vision/resnet50_distill.py`
 is the absorbed-vs-random matched-compression ladder. Tested on a real torchvision ResNet
 (`tests/test_fsd_vision_resnet.py`).
 

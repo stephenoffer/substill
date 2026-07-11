@@ -1,13 +1,50 @@
 # Gap analysis: what is actually novel in FASD/FSD, and what is not
 
+> **Addendum, 2026-07-11 — LRD vs the current (past-6-month) literature.** The novel method
+> that survived re-measurement is **Learned Restriction Distillation** (train the residual
+> projection `V` on the Stiefel manifold against the KD loss; [../docs/learned_restriction.md](../docs/learned_restriction.md)).
+> A fresh sweep of Jan–Jul 2026 low-rank/SVD compression confirms its niche is still open. The
+> recent cluster — **AIR** (2606.19993), **LASER** (2604.17224), **Swift-SVD** (2605),
+> **SVD-LLM v2** (2503.12340), **IO-SVD** (2605.15626), **SigmaScale** (2606.07098), **COMPOT**
+> (2602.15200), **SAES-SVD** (ICLR'26 2602.03051), and rank-allocation **UniRank** (2606.21847)
+> / **ARA** (2510.19389) / **LLRC** (2512.13733) — all pick the subspace by a *frozen surrogate*
+> (activation / influence / reconstruction) and do **not** distill. Dropped into an identical
+> distillation pipeline as the frozen basis, the best of them (AIR's activation+influence, 79.98
+> PPL) loses to LRD's trained `V` (75.45) by **5.7%, ≈5σ** (`docs/learned_restriction.md` §4a).
+> The only recent methods that *train* a Stiefel/orthogonal projection — **MAPL** (2606.05484)
+> and **MatryoshkaKV** (2410.14731) — do so for pipeline-parallel activation communication and
+> the KV cache respectively, not weight-side full-model compression. Rank allocation is an
+> orthogonal axis (composable with the repo's DDR). **LRD's contribution stands against the
+> current literature.**
+>
+> **Addendum, 2026-07-10.** All 17 arXiv IDs cited here and in the follow-up novelty
+> sweep were independently verified to exist (abstract page + export API). Two labels
+> were wrong and are corrected below. Separately, the *empirical* premise of §4 has not
+> survived re-measurement — see [../docs/init_findings.md](../docs/init_findings.md).
+> In particular, the absorbed-init baseline these contributions are layered on was built
+> with a silently-broken residual basis, and its measured advantage does not come from
+> subspace fidelity. Re-derive the contribution list against that document before writing.
+>
+> Additional prior art found in the 2026-07 sweep, all confirmed real and directly
+> relevant: **SAES-SVD** (2602.03051, cross-layer accumulated-error suppression for SVD
+> compression), **Fisher-Aligned Subspace Diagnostics** (2601.07197 — the acronym is
+> FASD, colliding with this repo's), **MoDeGPT** (2408.09632, residual-preserving
+> inner-dim compression via `V_out^T W V_in`-equivalent init), **Lillama** (2412.16719,
+> low-rank init + feature distillation), **Low-Rank Clone** (2505.12781), **MatryoshkaKV**
+> (2410.14731, trainable orthogonal projections trained with a distillation objective),
+> **"Don't be so Stief!"** (2601.21686, Stiefel-manifold KV-cache factors),
+> **LLRC** (2512.13733, distillation-loss-driven differentiable rank),
+> **Weight Subcloning** (2312.09299), and **"Variance Is Not Importance"** (2604.20682),
+> which independently reports that activation variance is a poor importance proxy —
+> consistent with §2 of `init_findings.md`.
+
 **Date:** 2026-06-17
 **Purpose:** Establish, honestly and adversarially, which parts of this method are
 genuinely unclaimed against the 2024–2026 literature, so the paper leads with a
 contribution that survives review rather than one that gets desk-rejected on novelty.
 
-This document is the output of Phase 0.1 of the rebuild plan
-(`~/.claude/plans/twinkly-wishing-glacier.md`). It is deliberately self-critical: we
-would rather kill a claim here than have a reviewer kill it.
+This document is deliberately self-critical: we would rather kill a claim here
+than have a reviewer kill it.
 
 ---
 

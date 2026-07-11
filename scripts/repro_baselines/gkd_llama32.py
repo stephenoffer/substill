@@ -7,7 +7,7 @@ interpolates between forward-KL (α=0) and reverse-KL (α=1).
 This is a simplified rolling implementation. For tight reproduction, replace
 ``train_loop`` with one that draws batches half from the corpus and half from
 fresh student rollouts each step (using
-:mod:`fasd.training.onpolicy.HybridCollator`).
+:mod:`substill.training.onpolicy.HybridCollator`).
 """
 
 from __future__ import annotations

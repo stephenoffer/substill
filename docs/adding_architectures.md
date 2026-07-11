@@ -1,7 +1,7 @@
 # Adding a new model architecture
 
 FSD/CPSD is architecture-agnostic via the declarative `ArchitectureSpec`
-(`fasd/arch/spec.py`). Adding a model family is **data, not code** — no new
+(`substill/arch/spec.py`). Adding a model family is **data, not code** — no new
 `_detect_*`/`_build_*`/`fold_*` functions. This replaces the old ~200-line-per-arch
 forks (the "3–5 days per architecture" problem).
 
@@ -11,7 +11,7 @@ forks (the "3–5 days per architecture" problem).
 
 ```python
 from dataclasses import replace
-from fasd.arch import LLAMA_SPEC, EdgeTemplate, FoldTemplate, register_arch
+from substill.arch import LLAMA_SPEC, EdgeTemplate, FoldTemplate, register_arch
 
 # Llama-family variant (Mistral, Qwen2.5) — usually just a matcher change:
 register_arch(replace(LLAMA_SPEC, name="mistral",
@@ -21,7 +21,7 @@ register_arch(replace(LLAMA_SPEC, name="mistral",
 For a genuinely new layout, declare the per-block template:
 
 ```python
-from fasd.arch import ArchitectureSpec, EdgeTemplate, FoldTemplate
+from substill.arch import ArchitectureSpec, EdgeTemplate, FoldTemplate
 
 MYARCH_SPEC = ArchitectureSpec(
     name="myarch",
@@ -57,7 +57,7 @@ profiling, `width_pruner` aggregation, losses, and the CPSD components work unch
 ### 2. (MoE only) add a `MoESpec`
 
 ```python
-from fasd.arch import MoESpec
+from substill.arch import MoESpec
 moe = MoESpec(
     experts_rel="mlp.experts",          # path to the experts container/tensor
     router_rel="mlp.gate",              # router (stays full-rank)
@@ -73,7 +73,7 @@ for per-expert rank allocation (DDR). Note: on recent `transformers` the experts
 ### 3. Verify branch detection
 
 ```python
-from fasd.arch import resolve_spec, expand_branches
+from substill.arch import resolve_spec, expand_branches
 spec = resolve_spec(model)                       # or pass name=
 for b in expand_branches(model, spec)[:8]:
     print(b.name, b.module_path, b.kind, b.slice)

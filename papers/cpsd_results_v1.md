@@ -9,8 +9,8 @@ F-ASD / FSD baselines at matched compression. Honest, mixed-but-promising.
 - 500 distillation steps, AdamW lr 3e-4 (StiefelAdam for Stiefel params), forward-KL loss
   for ALL variants (so the only difference is the novel component, not the objective).
 - Compute: separate Anyscale jobs, one per (compression × seed), compute-config
-  `asd-gpu-head` (single A10G). Harness `scripts/fsd_headline_experiment.py`; submit
-  `scripts/cpsd_experiment_submit.sh`; aggregate `scripts/cpsd_aggregate.py`.
+  `asd-gpu-head` (single A10G). Harness `scripts/fsd/fsd_headline_experiment.py`; submit
+  `scripts/cpsd/cpsd_experiment_submit.sh`; aggregate `scripts/cpsd/cpsd_aggregate.py`.
 - Compression ratios reported are INFERENCE (folded) — CPSD's factored `V_in/V_out`
   collapse to `W_S` at deployment.
 
@@ -108,7 +108,7 @@ manifold-trained bases over frozen absorbed-init. See docs/cpsd.md for the full 
 
 ## Measured — head-to-head harness + vision arm (2026-06-18, Anyscale A10G)
 
-**GPT-2 + WikiText-2 head-to-head (`scripts/cpsd_compare.py`, n=3 seeds, 300 steps, teacher 58.90):**
+**GPT-2 + WikiText-2 head-to-head (`scripts/cpsd/cpsd_compare.py`, n=3 seeds, 300 steps, teacher 58.90):**
 
 | variant | 4.35× | 7.23× |
 |---|---|---|
@@ -127,7 +127,7 @@ manifold-trained bases over frozen absorbed-init. See docs/cpsd.md for the full 
   CPSD-full **546.6 ± 2.5 beats** absorbed-init 558.9 ± 12.9 — a modest win with the lowest
   variance. Raw: `runs/bench_v1/v3_c2_*.json`. (7.23× free-core re-run `cmp-v4` in flight.)
 
-**ResNet50 → CIFAR-10 (`scripts/resnet50_distill.py`, teacher top-1 73.6%, 2000 steps):** absorbed-init
+**ResNet50 → CIFAR-10 (`scripts/vision/resnet50_distill.py`, teacher top-1 73.6%, 2000 steps):** absorbed-init
 beats random-init at matched compression — width 0.5: **81.1% vs 64.8%** (+16.2pts); width 0.35:
 **78.9% vs 64.7%** (+14.3pts). The vision counterpart of the LLM absorbed-init win.
 
@@ -138,12 +138,12 @@ Original capability notes:
 
 - **DDR wired end-to-end** (`FSDConfig(use_diff_rank=True)`): KD-driven differentiable rank
   trains jointly with the manifold factors and folds to a deployable plain-`nn.Linear` student.
-- **Controlled foil for the central claim** (`scripts/cpsd_compare.py`): the matched-compression
+- **Controlled foil for the central claim** (`scripts/cpsd/cpsd_compare.py`): the matched-compression
   ladder now includes `cpsd_full` (MT + KD-driven rank) vs `dobi_svd` (the *same* pipeline with
-  the KD term zeroed = Dobi-SVD's reconstruction-driven rank). `scripts/cpsd_aggregate.py` prints
+  the KD term zeroed = Dobi-SVD's reconstruction-driven rank). `scripts/cpsd/cpsd_aggregate.py` prints
   the KD-driven-vs-reconstruction-driven verdict per cell. This is the experiment that, when run,
   tests whether the DDR contribution is real. KQ-SVD/DistiLLM-2/Minitron/RFID-MoE remain deferred
   (KQ-SVD is a different compression axis; the others cite published numbers).
-- **Vision arm** (`fasd.vision`, `scripts/resnet50_distill.py`): the framework now spans non-LLM
+- **Vision arm** (`fasd.vision`, `scripts/vision/resnet50_distill.py`): the framework now spans non-LLM
   CNNs — conv2d absorbed-init narrows ResNet Bottleneck inner channels and `distill_classifier`
   distils on class logits, giving an absorbed-vs-random matched-compression ladder for ResNet50.

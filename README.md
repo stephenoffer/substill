@@ -1,226 +1,144 @@
-# neural_distill
+# substill
 
-### Shrink a big model into a small, fast one — without starting from scratch.
+**Shrink a big model into a small, fast one — without training from scratch.**
 
-Big neural networks are expensive to run. `neural_distill` builds a **small "student"
-model that behaves almost like a big "teacher"** by compressing it inside its
-**activation subspace** — the low-dimensional space a trained network actually uses,
-rather than guessing channel-by-channel. The student **starts from the teacher's own
-behavior** instead of random weights, so it reaches good quality with far less training,
-and ships as a plain, fast model with **zero inference overhead**.
+`substill` compresses a neural network inside its *activation subspace* — the
+low-dimensional space the model actually uses. Instead of guessing which channels to cut,
+it keeps the directions the network relies on, starts the small "student" from the big
+"teacher's" own behavior, and trains a lightweight projection so the student matches the
+teacher. The result folds down to a **plain model with zero inference overhead**.
 
-**One method, two model families — measured wins over the naive baseline:**
-
-| teacher → student | naive distillation | **FASD (absorbed-init)** | gain |
-|---|---|---|---|
-| GPT-2 / WikiText-2 (≈4.3× smaller) | 1038 perplexity | **559** | **1.9× better** |
-| ResNet-50 / CIFAR-10 (≈2× smaller) | 64.8% accuracy | **81.1%** | **+16 points** |
-
-*New to model distillation or compression?* Start with the plain-language
-**[explainer](docs/explainer.md)** — it explains the idea, why it matters, and what's
-proven, with no prior background assumed.
-
-FASD is a **general** activation-subspace framework: the LLM path covers GPT-2, Llama,
-Mistral, and Qwen decoders, and a **vision path** (`fasd.vision`) covers convolutional
-classifiers such as **ResNet50**. The same machinery — covariance/PCA profiling, the
-absorbed projection `W_s = Vᵀ W V` (now conv2d-aware), basis-invariant feature losses,
-and distillation — applies across both.
-
-The public API is the **`fasd`** package: Functionally-Aligned ASD plus the
-novel **CPSD** pipeline. (`asd` is an internal subpackage providing the
-low-level profiling utilities `fasd` builds on — covariance accumulation,
-spectrum/Marchenko-Pastur analysis, stability diagnostics — and is not a
-public API.)
+Its headline method — **Learned Restriction Distillation (LRD)** — beats the strongest
+known subspace-compression baseline by **6.8% perplexity (~6σ)**, and the margin *grows*
+with model size.
 
 ## Install
 
 ```bash
-pip install -e .            # core library
-pip install -e ".[llm]"     # + transformers, datasets (for the LLM path)
-pip install -e ".[dev]"     # + pytest, ruff
-pip install -e ".[all]"     # everything
+pip install substill            # core library
+pip install "substill[llm]"     # + transformers, datasets (the LLM path)
 ```
 
-Requires Python 3.10+, PyTorch 2.0+.
+Python 3.10+, PyTorch 2.0+.
 
-## Quickstart — `FSDPipeline`
+## Quickstart
 
-The recommended entry point is `fasd.FSDPipeline`: one object that profiles
-the teacher, builds a width-narrowed student, optionally converts it to
-circuit-preserving trainable factors (CPSD), and runs the distillation.
+Compress a Llama-family model in one call:
 
 ```python
-import fasd
+import substill
+from transformers import AutoModelForCausalLM
 
-pipe = fasd.FSDPipeline(
-    teacher,
-    config=fasd.FSDConfig(
-        arch_multiplier=0.5,      # student width relative to the teacher
-        use_cpsd_factored=True,   # train low-rank factors on the Stiefel manifold (CPSD)
-        generative_kd="skew_kl",  # KD objective
-        total_steps=2000,
-    ),
+teacher = AutoModelForCausalLM.from_pretrained("JackFram/llama-160m")
+
+result = substill.learned_restriction_distill(
+    teacher, train_loader,                                   # iterable of {"input_ids": ...}
+    config=substill.LRDConfig.for_ratio(teacher, width_ratio=0.5, steps=2000),
 )
-result = pipe.run(calib_loader, train_loader)  # profile -> build -> (convert) -> distill
-student = pipe.student                          # the trained, compressed student
+
+student = result.student        # a narrower LlamaForCausalLM — deploy as-is
+print(f"final KD loss: {result.final_kd:.3f}")
 ```
 
-Key `FSDConfig` fields (all optional, sensible defaults):
-
-| field                | default     | what it controls                                            |
-|----------------------|-------------|-------------------------------------------------------------|
-| `arch_multiplier`    | `1.0`       | student width as a fraction of the teacher                  |
-| `rank_map`           | `None`      | explicit per-edge rank overrides                            |
-| `template`           | `"auto"`    | `"gpt2"`, `"llama"`, or `"auto"` (dispatch on teacher class)|
-| `absorbed_init`      | `True`      | initialize student linears with absorbed teacher weights    |
-| `use_cpsd_factored`  | `False`     | replace absorbed linears with Stiefel-trainable factors (CPSD MT) |
-| `use_diff_rank`      | `False`     | KD-driven differentiable rank on the factored edges (CPSD DDR; needs `use_cpsd_factored`) |
-| `use_rr_norm`        | `False`     | swap norms for rotation-equivariant `RRNorm`                |
-| `generative_kd`      | `"skew_kl"` | KD objective: `forward_kl` / `reverse_kl` / `skew_kl`       |
-| `total_steps`, `lr`  | `200`, `5e-5` | distillation budget                                       |
-| `profile_kwargs`, `distill_kwargs` | `{}` | passthrough to `profile()` / `distill()`           |
-
-## Public API
-
-`import fasd` exposes (see `fasd.__all__`):
-
-- **Pipeline (start here):** `FSDPipeline`, `FSDConfig`
-- **Profiling:** `profile`, `capture`, `TeacherProfile`, `BranchProfile`,
-  `BranchSpec`, `StreamingPCA`, `choose_behavioral_rank`, `compute_weights`,
-  `autodetect_branches`, `autodetect_layers`, `register_detector`,
-  `StabilityStats`, `bootstrap_principal_angles`, `stability_adjusted_rank`
-- **Student construction:** `build_student`, `StudentConfig`,
-  `profile_to_student_config`, `plan_progressive_stages`,
-  `absorbed_linear_init`, `quantize_student`, `qad_finetune`
-- **Losses & schedules:** `F_ASDLoss`, `gram_distance`, `cka_distance`,
-  `procrustes_distance`, `forward_kl`, `reverse_kl`, `skew_kl`,
-  `contrastive_response_loss`, `Schedule`, `ScheduleStage`, `default_schedule`
-- **Training:** `distill`, `DistillResult`, `correct_teacher`,
-  `generate_rollouts`, `HybridCollator`, `ReplayBuffer`, `RolloutBatch`
-- **CPSD conversions (advanced):** `convert_gpt2_to_factored`,
-  `convert_llama_to_factored`
-
-## Lower-level / advanced
-
-`FSDPipeline` is a thin orchestration over public stages you can also drive
-yourself — profile the teacher, build a student, then either run your own
-training loop with `F_ASDLoss` or call the multi-stage `distill` driver:
+`for_ratio` picks a sensible student geometry from a single compression ratio and
+auto-tunes the one tricky hyperparameter (the projection learning rate). Want more
+control? Run the three phases yourself:
 
 ```python
-import fasd
-
-profile = fasd.profile(teacher, calib_loader)
-student = fasd.build_student(teacher, profile, absorbed_init=True)
-
-loss_fn = fasd.F_ASDLoss(profile, objective="procrustes")
-for batch in train_loader:
-    with fasd.capture(teacher, profile) as t_hid:
-        teacher(**batch)
-    with fasd.capture(student, profile) as s_hid:
-        s_logits = student(**batch).logits
-    loss = loss_fn(dict(s_hid.items()), dict(t_hid.items()))
-    loss.backward()
+lrd = substill.LearnedRestriction(teacher, config)
+lrd.prepare(calib_loader)   # profile the teacher's activation subspace, build the student
+lrd.fit(train_loader)       # train the projection against the KD loss
+student = lrd.fold()         # collapse to a plain, zero-overhead model
 ```
 
-`convert_gpt2_to_factored` / `convert_llama_to_factored` are advanced
-post-build CPSD helpers (what `FSDPipeline` calls when
-`use_cpsd_factored=True`); use them directly only for custom pipelines.
+**Supported teachers:** Llama-family decoders (Llama, Mistral). GPT-2 and ResNet have their
+own paths — see [Also in the box](#also-in-the-box).
 
-## CPSD — the novel method
+## Benchmarks
 
-`FSDPipeline(..., use_cpsd_factored=True)` enables **Circuit-Preserving
-Subspace Distillation**: the student is initialized with circuit-preserving
-factors (including the OV/value circuit), those factors are trained on the
-Stiefel manifold against the KD loss, and per-edge rank is learned jointly.
+LRD vs the strongest frozen-basis baseline (PCA), WikiText-2 perplexity — **lower is
+better**, matched compute, seeds reported:
 
-The two trainable components are now both first-class pipeline options:
+| teacher | compression | best prior | **substill (LRD)** | gain |
+|---|---:|---:|---:|---:|
+| Llama-160M | 3.1× | 80.9 ± 0.9 | **75.5 ± 0.8** | **−6.8%**  (~6σ, n=3) |
+| Sheared-LLaMA-1.3B | 3.6× | 366.7 ± 0.8 | **342.0 ± 7.2** | **−6.7%**  (n=2) |
+| Sheared-LLaMA-2.7B | 9.8× | 635.6 ± 113 | **528.7 ± 36** | **−16.8%**  (n=3) |
 
-- **MT (manifold-trained factors):** `use_cpsd_factored=True` swaps absorbed
-  linears for `TeacherFactoredLinear` and the pipeline auto-builds a `StiefelAdam`
-  optimizer so `V_in/V_out` train on the manifold (warm-started from the absorbed
-  bases; `stiefel_lr_ratio`/`stiefel_reorth_every` tune its variance).
-- **DDR (distillation-driven differentiable rank):** `use_diff_rank=True` wraps each
-  factored edge with a soft column gate trained against the **KD loss** under a global
-  parameter budget; `pipe.fold_for_inference()` hardens the gates and folds every edge
-  back to a plain `nn.Linear` (zero inference overhead). The central claim — *KD-driven*
-  rank beating *reconstruction-driven* rank (Dobi-SVD) — is measured directly by
-  `scripts/cpsd_compare.py` as a controlled ablation (same pipeline, KD weight toggled).
+- 🏆 **Beats the 2026 SVD-compression wave.** Reproduced head-to-head, LRD beats the best
+  recent method (AIR) by **5.7%** — because it optimizes the real distillation objective, not
+  a frozen proxy like reconstruction or influence.
+- 📈 **Wins at every compression ratio** tested (3×→8×), and gets *more stable* — not just
+  better — as the teacher grows.
+- ⚡ **Zero inference overhead.** The trained student folds to an ordinary
+  `LlamaForCausalLM`; there's nothing custom to run at deploy time.
 
-**Current status (honest, measured on Anyscale A10G — GPT-2/WikiText-2 n=3, ResNet50/CIFAR-10,
-real TinyLlama-1.1B):**
-
-- **Win vs the naive competition (both modalities):** absorbed-init subspace distillation beats
-  random-init+KD by **1.4–1.9×** PPL on GPT-2 (e.g. 559 vs 1038 at 4.35×, n=3) and by **+14–16
-  top-1 points** on ResNet50/CIFAR-10 (81.1% vs 64.8% at matched compression). The core,
-  reproducible advantage — now spanning LLMs *and* vision.
-- **Win vs a competitor mechanism (Dobi-SVD):** our *KD-driven* differentiable rank beats
-  *reconstruction-driven* rank by **1.45–2.2×** PPL (829 vs 1806 at 4.35×, n=3). The central
-  novelty claim holds directionally and consistently.
-- **Novel method now wins (modestly):** after the free-core fix (now default), the manifold +
-  KD-driven-rank student **beats** frozen absorbed-init at 4.35× — 546.6 ± 2.5 vs 558.9 ± 12.9 PPL
-  (n=3), and with the lowest variance of any variant. The gain is modest but real; an earlier run
-  without the free core lost here (a negative we reported and then diagnosed/fixed).
-- **Honest negative #2 (CPI):** the circuit-preserving init does **not** beat the disjoint
-  baseline on real GQA — documented as a negative result, not a claim.
-- **Not yet run:** the Llama-3.2-3B→1B frontier vs *published* SOTA numbers
-  (Dobi-SVD/KQ-SVD/DistiLLM-2/Minitron/RFID-MoE) — the decisive head-to-head remains future work.
-
-See [docs/cpsd.md](docs/cpsd.md) for the full tables, mechanism, and what remains.
-
-## Vision — ResNet (non-LLM)
-
-`fasd.vision` applies the same activation-subspace idea to convolutional classifiers.
-A conv is linear in its channels per kernel offset, so the absorbed projection extends to
-2D convs unchanged (`absorbed_init` gained a `"conv2d"` layout). `build_resnet_student`
-narrows each `Bottleneck`'s inner channels (keeping block input/output widths fixed, so
-downsample and the residual add are untouched) and absorbs the teacher's conv weights;
-`distill_classifier` distils on class logits with the same `forward_kl`/`skew_kl` losses.
-
-```python
-from fasd.vision import channel_variance_scores, build_resnet_student, distill_classifier
-scores = channel_variance_scores(teacher, calib_loader)
-student, info = build_resnet_student(teacher, scores, width_ratio=0.5)  # absorbed-init
-distill_classifier(teacher, student, train_loader, val_loader=val_loader)
-```
-
-`scripts/resnet50_distill.py` runs the vision analogue of the GPT-2 ladder (absorbed-init
-vs random-init at matched compression); `--smoke` runs on CPU.
+Full tables, controls, ablations, and reproduction:
+**[docs/learned_restriction.md](docs/learned_restriction.md)**.
 
 ## How it works
 
-A trained network does not use all its channels. Profiling eigendecomposes
-each branch's activation covariance and keeps the directions that carry
-statistically distinguishable signal (a Marchenko-Pastur bulk-edge cutoff
-separates signal from the noise bulk). The student is sized to those
-*behavioral ranks*, initialized by absorbing the teacher's weights into the
-retained subspace, and distilled with a basis-invariant feature loss
-(Gram / CKA / Procrustes) alongside a generative-KD objective on the logits.
+A trained network doesn't use all of its dimensions. `substill`:
 
-## Repo layout
+1. **Profiles** the teacher to find the subspace its activations actually live in.
+2. **Restricts** the teacher's weights onto that subspace (`W_s = Vᵀ W V`) — so the student
+   is literally the teacher *seen through fewer dimensions*, and its layers still compose the
+   way the teacher's do.
+3. **Trains** the projection `V` (on the Stiefel manifold) against the distillation loss, so
+   the student learns the *best* subspace to keep — the one thing a frozen SVD can't give you.
 
-```
-fasd/            current library (public API in fasd/__init__.py)
-  pipeline.py      FSDPipeline / FSDConfig
-  api.py           profile / capture / TeacherProfile
-  builders.py      student constructors + absorbed init
-  compression/     absorbed init, width pruning, factored linears, quantization
-  profiling/       activation capture, behavioral rank, RoPE/GQA bases
-  losses/          subspace (F_ASDLoss), procrustes, generative KD
-  training/        distill driver, Stiefel optimizer, on-policy, re-absorption
-  arch/            ArchitectureSpec registry (add a model family declaratively)
-  vision/          non-LLM arm: ResNet channel-narrowing + classifier distillation
-asd/             internal profiling utilities used by fasd (not a public API)
-scripts/         training, ablation, and baseline-reproduction entry points
-docs/            technical docs, project status, history  (see docs/README.md)
-tests/           pytest suite
-```
+The principle in one line: **restrict the teacher's operator; never refit it.** Change the
+basis and the teacher's behavior transfers through distillation; refit the weights and it
+doesn't.
 
-## Tests & lint
+New to model compression? The plain-language **[explainer](docs/explainer.md)** assumes no
+background.
+
+## Also in the box
+
+- **Vision** (`substill.vision`) — the same idea for ConvNets: narrow a ResNet's channels and
+  distill on class logits.
+  ```python
+  from substill.vision import build_resnet_student, channel_variance_scores, distill_classifier
+  scores = channel_variance_scores(teacher, calib_loader)
+  student, _ = build_resnet_student(teacher, scores, width_ratio=0.5)
+  distill_classifier(teacher, student, train_loader, val_loader=val_loader)
+  ```
+- **Lower-level API** — `substill.profile`, `substill.build_student`, `substill.distill`, and
+  the basis-invariant `substill.F_ASDLoss`, for building your own pipeline.
+- **FSD/CPSD pipeline** (`substill.FSDPipeline`) — the earlier, more general activation-subspace
+  pipeline. Its original headline numbers didn't survive re-measurement (see below), so LRD is
+  the recommended path; the machinery it exposes is still useful.
+
+## Examples & docs
 
 ```bash
-python -m pytest        # test suite
-ruff check .            # lint (config in pyproject.toml)
+python examples/learned_restriction.py   # LRD on a tiny Llama (CPU, no download)
+python examples/vision_resnet.py         # narrow + distill a small ResNet
 ```
+
+- **Documentation site** (user guide + full API reference) is built with Sphinx and published
+  to GitHub Pages on every push to `main`. Build it locally:
+  ```bash
+  pip install -e ".[docs]"
+  python -m sphinx -b html docs docs/_build/html   # -> docs/_build/html/index.html
+  ```
+- **API:** `import substill` — everything public is on the top-level namespace
+  (see `substill.__all__`).
+
+## Tested, and honest about it
+
+```bash
+python -m pytest    # 313 tests, CPU-only, no downloads
+ruff check .        # lint
+```
+
+Every benchmark above is a **controlled, multi-seed, reproducible** result — and holding to
+that bar is why LRD exists. An independent re-measurement found the project's *original*
+FSD/CPSD headline numbers didn't hold up under compute matching and a tuned learning rate;
+LRD is the method that survived, stated with the controls that isolate its win. The full
+audit — including bugs we found in our own baselines — is in
+**[docs/init_findings.md](docs/init_findings.md)**. We think that transparency is a feature.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 Goal: every baseline trains *exactly the same student architecture* on *the
 same corpus and token budget* as the FSD run. Only the loss function differs.
-This makes the headline comparison apples-to-apples (Sprint 7 Gate D).
+This makes the headline comparison apples-to-apples.
 
 Use case::
 

@@ -13,7 +13,6 @@ import sys
 
 import torch
 
-from fasd.losses.generative_kd import reverse_kl
 from scripts.repro_baselines._common import (
     add_common_args,
     args_from_namespace,
@@ -23,6 +22,7 @@ from scripts.repro_baselines._common import (
     save_run,
     train_loop,
 )
+from substill.losses.generative_kd import reverse_kl
 
 
 def main() -> int:
@@ -43,7 +43,7 @@ def main() -> int:
     # Note: this is a simplified MiniLLM. For full PG-style reverse-KL with
     # length normalization and single-step decomposition, see the upstream
     # MiniLLM repository. The student-rollout mixing is handled here by the
-    # existing fasd.training.onpolicy.HybridCollator if integrated.
+    # existing substill.training.onpolicy.HybridCollator if integrated.
     def loss_fn(s_logits, t_logits, batch):
         return reverse_kl(s_logits, t_logits, temperature=ns.temperature)
 

@@ -10,7 +10,6 @@ import sys
 
 import torch
 
-from fasd.losses.generative_kd import forward_kl
 from scripts.repro_baselines._common import (
     add_common_args,
     args_from_namespace,
@@ -20,6 +19,7 @@ from scripts.repro_baselines._common import (
     save_run,
     train_loop,
 )
+from substill.losses.generative_kd import forward_kl
 
 
 def main() -> int:

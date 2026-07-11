@@ -1,0 +1,31 @@
+# Anyscale job template for one F-ASD ablation rung.
+# Submitted 8 times, once per FASD_RUNG value (see fasd_ablation_submit.sh).
+name: substill-ladder-${FASD_TAG}-${FASD_RUNG}
+compute_config: asd-gpu-head
+working_dir: .
+excludes:
+  - "*.pyc"
+  - "__pycache__"
+  - ".git"
+  - ".pytest_cache"
+  - "*.profile"
+  - "*.substill"
+env_vars:
+  FASD_TAG: ${FASD_TAG}
+  FASD_RUNG: ${FASD_RUNG}
+  HF_HOME: /mnt/cluster_storage/hf
+  PYTHONUNBUFFERED: "1"
+entrypoint: |
+  set -eo pipefail
+  pip install --quiet transformers==5.6.1 datasets==3.6.0 tqdm
+  echo "[$(date +%H:%M:%S)] starting rung=${FASD_RUNG} tag=${FASD_TAG}"
+  python scripts/fsd/fasd_ablation.py \
+    --rung "${FASD_RUNG}" \
+    --tag "${FASD_TAG}" \
+    --teacher gpt2 \
+    --batch-size 4 \
+    --seq-len 128 \
+    --total-steps 1000 \
+    --rank-tol 0.02 \
+    --max-rank 512 \
+    --calib-batches 8

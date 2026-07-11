@@ -1,21 +1,21 @@
 # FSD rebuild — handoff
 
-This document describes what's been built in the FSD rebuild, what's tested, and what remains for the user to execute on H100 cluster compute. The plan being executed is at [/home/ray/.claude/plans/i-read-the-preprint-zesty-dream.md](/home/ray/.claude/plans/i-read-the-preprint-zesty-dream.md).
+This document describes what has been built in the FSD rebuild, what is tested, and what remains to execute on H100 cluster compute.
 
 ## Status snapshot
 
 | Sprint | Status | Tests | Notes |
 |---|---|---|---|
-| 0 — Reproducible foundation | ✅ Done | 8 | Param accounting library |
-| 1 — RR-Norm + γ-fold (Pillar 1) | ✅ Done | 18 | γ-fold parity verified end-to-end on GPT-2 + Llama; RR-Norm semantics tested |
-| 2 — GQA shared-per-KV-group basis | ✅ Math + tests done | 9 | Joint per-group PCA; headline test (shared > disjoint on synthetic GQA) passes. Builder integration follow-up. |
-| 3 — Fisher scoring + exact allocator | ✅ Done | 16 | Discriminating test: Fisher score picks low-variance high-task-relevance direction over high-variance low-relevance |
-| 4 — Block-diagonal sparse correction (Pillar 3) | ✅ Done | 9 | Per-head dense block; init=zero; orthogonal to V |
-| 5 — Trainable Stiefel bases (Pillar 2) | ✅ Done | 10 | Cayley retraction (Wen-Yin §2.4 efficient form), Adafactor row/col second moments, mixed param groups, 1000-step long-run orthogonality drift < 1e-4 |
-| 6 — Adaptive objective + token weighting + plateau detector | ✅ Done | 14 | Per-token entropy-gap skew-KL, unified token weights, EMA-slope plateau detector |
-| 7 — Llama-3.2 main script + 4 baselines + eval harness | ✅ Code done | 7 | Compute-deferred for actual runs; pipeline helpers (sparse-block injection, student_arch.json writeback) tested |
-| 8 — Handoff + ablation grid + GQA notes | ✅ This doc | — | |
-| Post-Sprint integration | ✅ Done | 6 | Allocator rank-map → builder; pipeline helpers wired into trainer |
+| 0 — Reproducible foundation | Done | 8 | Param accounting library |
+| 1 — RR-Norm + γ-fold (Pillar 1) | Done | 18 | γ-fold parity verified end-to-end on GPT-2 + Llama; RR-Norm semantics tested |
+| 2 — GQA shared-per-KV-group basis | Math + tests done | 9 | Joint per-group PCA; headline test (shared > disjoint on synthetic GQA) passes. Builder integration follow-up. |
+| 3 — Fisher scoring + exact allocator | Done | 16 | Discriminating test: Fisher score picks low-variance high-task-relevance direction over high-variance low-relevance |
+| 4 — Block-diagonal sparse correction (Pillar 3) | Done | 9 | Per-head dense block; init=zero; orthogonal to V |
+| 5 — Trainable Stiefel bases (Pillar 2) | Done | 10 | Cayley retraction (Wen-Yin §2.4 efficient form), Adafactor row/col second moments, mixed param groups, 1000-step long-run orthogonality drift < 1e-4 |
+| 6 — Adaptive objective + token weighting + plateau detector | Done | 14 | Per-token entropy-gap skew-KL, unified token weights, EMA-slope plateau detector |
+| 7 — Llama-3.2 main script + 4 baselines + eval harness | Code done | 7 | Compute-deferred for actual runs; pipeline helpers (sparse-block injection, student_arch.json writeback) tested |
+| 8 — Handoff + ablation grid + GQA notes | This doc | — | |
+| Post-Sprint integration | Done | 6 | Allocator rank-map → builder; pipeline helpers wired into trainer |
 
 **Total tests**: 211 passing (99 baseline + 112 new across 12 new test files). Run `python -m pytest tests/ -q` to verify.
 
@@ -42,15 +42,15 @@ This document describes what's been built in the FSD rebuild, what's tested, and
 - [fasd/training/stiefel_optim.py](../fasd/training/stiefel_optim.py) — `StiefelAdam` with Cayley retraction + Adafactor + reorthogonalisation, `stiefel_param_groups` helper ([test](../tests/test_fsd_stiefel_optim.py))
 - Extensions to [fasd/losses/generative_kd.py](../fasd/losses/generative_kd.py): `adaptive_skew_kl`, `unified_token_weights`, `PlateauDetector` ([test](../tests/test_fsd_adaptive_objective.py))
 - Extensions to [fasd/compression/width_pruner.py](../fasd/compression/width_pruner.py) and [fasd/builders.py](../fasd/builders.py): `rank_map=` kwarg threading ([test](../tests/test_fsd_rank_map_integration.py))
-- Pipeline helpers in [scripts/distill_llama32_fsd.py](../scripts/distill_llama32_fsd.py): `inject_sparse_blocks`, `write_student_arch_json` ([test](../tests/test_fsd_pipeline_helpers.py))
-- [scripts/fsd_headline_experiment.py](../scripts/fsd_headline_experiment.py) — GPT-2 + WikiText-2 smoke; produced the report numbers (no test, run-to-completion script)
+- Pipeline helpers in [scripts/fsd/distill_llama32_fsd.py](../scripts/fsd/distill_llama32_fsd.py): `inject_sparse_blocks`, `write_student_arch_json` ([test](../tests/test_fsd_pipeline_helpers.py))
+- [scripts/fsd/fsd_headline_experiment.py](../scripts/fsd/fsd_headline_experiment.py) — GPT-2 + WikiText-2 smoke; produced the report numbers (no test, run-to-completion script)
 
 ### Scripts
 
-- [scripts/distill_llama32_fsd.py](../scripts/distill_llama32_fsd.py) — main FSD training script, all pillars composable via flags
+- [scripts/fsd/distill_llama32_fsd.py](../scripts/fsd/distill_llama32_fsd.py) — main FSD training script, all pillars composable via flags
 - [scripts/repro_baselines/](../scripts/repro_baselines/) — matched-architecture reproductions of vanilla KD, DistiLLM, MiniLLM, GKD
-- [scripts/eval_harness.py](../scripts/eval_harness.py) — lm-evaluation-harness wrapper for headline zero-shot suite
-- [scripts/fsd_ablation_grid.py](../scripts/fsd_ablation_grid.py) — pillar ablation grid driver (cumulative ladder by default; `--full-grid` for 2^7 cross-product)
+- [scripts/fsd/eval_harness.py](../scripts/fsd/eval_harness.py) — lm-evaluation-harness wrapper for headline zero-shot suite
+- [scripts/fsd/fsd_ablation_grid.py](../scripts/fsd/fsd_ablation_grid.py) — pillar ablation grid driver (cumulative ladder by default; `--full-grid` for 2^7 cross-product)
 
 ## Pillar architecture summary
 
@@ -72,7 +72,7 @@ This is the compute-deferred half. Code is ready; user provides H100×4-8.
 
 ```bash
 cd neural_distill
-python scripts/distill_llama32_fsd.py \
+python scripts/fsd/distill_llama32_fsd.py \
     --teacher gpt2-medium \
     --corpus wikitext \
     --student-target-params 100_000_000 \
@@ -89,7 +89,7 @@ Verifies that all pillars compose, build_student → train_loop → save_run run
 ### Step 2 — pillar ablation on GPT-2 dev (~12-24 hours, 1 GPU)
 
 ```bash
-python scripts/fsd_ablation_grid.py \
+python scripts/fsd/fsd_ablation_grid.py \
     --teacher gpt2-medium \
     --corpus wikitext \
     --tokens-per-rung 100_000_000 \
@@ -111,7 +111,7 @@ For each of the four in-house baselines:
 
 ```bash
 # 1. Run FSD first to lock the student architecture.
-HF_TOKEN=... python scripts/distill_llama32_fsd.py \
+HF_TOKEN=... python scripts/fsd/distill_llama32_fsd.py \
     --teacher meta-llama/Llama-3.2-3B \
     --student-target-params 1.2e9 \
     --tokens-per-rung 10_000_000_000 \
@@ -138,7 +138,7 @@ Repeat for seeds 1, 2 and at the 5B / 20B token budgets.
 ### Step 4 — eval
 
 ```bash
-python scripts/eval_harness.py \
+python scripts/fsd/eval_harness.py \
     --runs 'runs/*_llama32_*_seed*' \
     --tokenizer meta-llama/Llama-3.2-3B \
     --tasks hellaswag,arc_easy,arc_challenge,piqa,winogrande,mmlu,lambada_openai,openbookqa,boolq \
@@ -155,19 +155,19 @@ Repeat Steps 3 and 4 with `--teacher Qwen/Qwen2.5-3B` and `--student-target-para
 
 **Post-Sprint-8 integration update (2026-05-02):** TODOs #1, #2, #3, #5 are now done. Only #4 (Stiefel registration on V_in/V_out — major builders.py refactor) and #6 (multi-GPU profiling) remain compute-deferred.
 
-### ✅ Done (post-Sprint-8 integration)
+### Done (post-Sprint-8 integration)
 
-1. ~~**Allocator rank-map → builder integration.**~~ ✅ Done. `profile_to_student_config` and `build_student` now accept `rank_map: dict[str, int] | None = None`. When provided, overrides each branch's `behavioral_rank` and disables `arch_multiplier` scaling. `distill_llama32_fsd.py:stage_e_build_student` passes `allocation_result.ranks` directly. Tests: `test_fsd_rank_map_integration.py` (6).
+1. ~~**Allocator rank-map → builder integration.**~~ Done. `profile_to_student_config` and `build_student` now accept `rank_map: dict[str, int] | None = None`. When provided, overrides each branch's `behavioral_rank` and disables `arch_multiplier` scaling. `distill_llama32_fsd.py:stage_e_build_student` passes `allocation_result.ranks` directly. Tests: `test_fsd_rank_map_integration.py` (6).
 
-2. ~~**Save `student_arch.json`.**~~ ✅ Done. `write_student_arch_json` in `distill_llama32_fsd.py` emits the JSON consumed by baseline scripts. Tests: `test_fsd_pipeline_helpers.py` (2).
+2. ~~**Save `student_arch.json`.**~~ Done. `write_student_arch_json` in `distill_llama32_fsd.py` emits the JSON consumed by baseline scripts. Tests: `test_fsd_pipeline_helpers.py` (2).
 
-3. ~~**Sparse-block injection points.**~~ ✅ Done. `inject_sparse_blocks` in `distill_llama32_fsd.py` walks student modules and replaces square `o_proj` / `down_proj` / `c_proj` with `CorrectedLinear`, copying weights and zero-initialising the per-head correction. Tests: `test_fsd_pipeline_helpers.py` (5).
+3. ~~**Sparse-block injection points.**~~ Done. `inject_sparse_blocks` in `distill_llama32_fsd.py` walks student modules and replaces square `o_proj` / `down_proj` / `c_proj` with `CorrectedLinear`, copying weights and zero-initialising the per-head correction. Tests: `test_fsd_pipeline_helpers.py` (5).
 
-4. ~~**FactoredLinear module (Stiefel-trainable U_in/U_out factors).**~~ ✅ Done as a standalone module. New `fasd/compression/factored_linear.py` exposes `FactoredLinear` with U_in, U_out, B all separately trainable (U on Stiefel via the existing optimizer). 15 tests pass including 1000-step long-run Stiefel preservation under StiefelAdam. **Builder integration deferred** — see "Remaining 4b" below.
+4. ~~**FactoredLinear module (Stiefel-trainable U_in/U_out factors).**~~ Done as a standalone module. New `fasd/compression/factored_linear.py` exposes `FactoredLinear` with U_in, U_out, B all separately trainable (U on Stiefel via the existing optimizer). 15 tests pass including 1000-step long-run Stiefel preservation under StiefelAdam. **Builder integration deferred** — see "Remaining 4b" below.
 
-5. ~~**GQA shared-per-KV-group basis math.**~~ ✅ Done. New module `fasd/profiling/gqa_basis.py` provides `joint_group_covariance`, `shared_bases_from_covariance`, and `collect_gqa_bases`. Headline test: `test_shared_basis_beats_disjoint_basis_on_synthetic_gqa` empirically demonstrates Sprint 2's contribution. Builder integration (replacing `_build_llama` GQA path) is the remaining follow-up.
+5. ~~**GQA shared-per-KV-group basis math.**~~ Done. New module `fasd/profiling/gqa_basis.py` provides `joint_group_covariance`, `shared_bases_from_covariance`, and `collect_gqa_bases`. Headline test: `test_shared_basis_beats_disjoint_basis_on_synthetic_gqa` empirically demonstrates Sprint 2's contribution. Builder integration (replacing `_build_llama` GQA path) is the remaining follow-up.
 
-6. ~~**Skip-unfoldable safeguard in `replace_layernorm_with_rrnorm`.**~~ ✅ Done. The helper now refuses to replace any LN whose γ ≠ 1 or β ≠ 0 (within tolerance), and inherits the parent's device/dtype when constructing new RRNorm modules. This prevents the v9 5-14 OOM init disaster when γ/β haven't been folded out (e.g. GPT-2's `ln_f`, which is tied to `lm_head` and so can't be γ-folded — it's now correctly left as plain LayerNorm).
+6. ~~**Skip-unfoldable safeguard in `replace_layernorm_with_rrnorm`.**~~ Done. The helper now refuses to replace any LN whose γ ≠ 1 or β ≠ 0 (within tolerance), and inherits the parent's device/dtype when constructing new RRNorm modules. This prevents the v9 5-14 OOM init disaster when γ/β haven't been folded out (e.g. GPT-2's `ln_f`, which is tied to `lm_head` and so can't be γ-folded — it's now correctly left as plain LayerNorm).
 
 ### Remaining
 

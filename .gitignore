@@ -26,3 +26,7 @@ papers/*.fls
 papers/*.fdb_latexmk
 papers/*.out
 papers/*.synctex.gz
+
+# Sphinx build output
+docs/_build/
+docs/_autosummary/

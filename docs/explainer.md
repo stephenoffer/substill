@@ -1,8 +1,8 @@
-# FASD, explained from scratch
+# substill, explained from scratch
 
 *A plain-language walkthrough for readers new to model compression and knowledge
-distillation. No prior familiarity with these algorithms is assumed. For the math, see
-[fasd/algorithm.md](fasd/algorithm.md); for the system and results, see [cpsd.md](cpsd.md).*
+distillation. No prior familiarity with these algorithms is assumed. For how the method
+works, see [concepts](concepts.md); for the numbers, see [benchmarks](benchmarks.md).*
 
 ---
 
@@ -130,7 +130,7 @@ spans both.
 - **One method, many model families.** The same pipeline compresses LLMs *and* CNNs. As models
   proliferate, a general compression principle is more valuable than a per-architecture hack.
 - **Honest, measurable claims.** Every number here was produced by a reproducible script
-  (`scripts/cpsd_compare.py`, `scripts/resnet50_distill.py`) on real hardware, with seeds and
+  (`scripts/cpsd/cpsd_compare.py`, `scripts/vision/resnet50_distill.py`) on real hardware, with seeds and
   baselines — including the comparisons we *lose* or only tie.
 
 ---
@@ -147,7 +147,6 @@ on a large model is the next milestone, not a finished claim.
 
 ## Where to go next
 
-- **Run it:** [fasd/quickstart.md](fasd/quickstart.md) (LLM) and the `fasd.vision` section of
-  the [top-level README](../README.md) (ResNet).
-- **The system and full results tables:** [cpsd.md](cpsd.md).
-- **The math:** [fasd/algorithm.md](fasd/algorithm.md).
+- **Run it:** the [user guide](guide.md) — the LRD one-call API, config, and the vision path.
+- **Understand it:** the [concepts](concepts.md) page — the restriction principle in depth.
+- **The evidence:** the [benchmarks](benchmarks.md), and the full [LRD study](learned_restriction.md).

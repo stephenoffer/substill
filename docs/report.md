@@ -1,8 +1,6 @@
 # FSD rebuild — final report
 
 **Date**: 2026-05-02
-**Repo**: `/home/ray/default_cld_g54aiirwj1s8t9ktgzikqur41k/neural_distill/`
-**Plan**: `/home/ray/.claude/plans/i-read-the-preprint-zesty-dream.md`
 
 ## Executive summary
 
@@ -47,11 +45,11 @@ Plus extensions to [fasd/losses/generative_kd.py](../fasd/losses/generative_kd.p
 
 **Scripts (~2,000 lines):**
 
-- [scripts/distill_llama32_fsd.py](../scripts/distill_llama32_fsd.py) — main FSD trainer (compute-deferred)
+- [scripts/fsd/distill_llama32_fsd.py](../scripts/fsd/distill_llama32_fsd.py) — main FSD trainer (compute-deferred)
 - [scripts/repro_baselines/](../scripts/repro_baselines/) — vanilla KD, DistiLLM, MiniLLM, GKD reproductions
-- [scripts/eval_harness.py](../scripts/eval_harness.py) — lm-evaluation-harness wrapper
-- [scripts/fsd_ablation_grid.py](../scripts/fsd_ablation_grid.py) — pillar ablation driver
-- [scripts/fsd_headline_experiment.py](../scripts/fsd_headline_experiment.py) — GPT-2 + WikiText-2 smoke (run in this session)
+- [scripts/fsd/eval_harness.py](../scripts/fsd/eval_harness.py) — lm-evaluation-harness wrapper
+- [scripts/fsd/fsd_ablation_grid.py](../scripts/fsd/fsd_ablation_grid.py) — pillar ablation driver
+- [scripts/fsd/fsd_headline_experiment.py](../scripts/fsd/fsd_headline_experiment.py) — GPT-2 + WikiText-2 smoke (run in this session)
 
 ## Headline experiment results
 
@@ -119,14 +117,14 @@ These items from HANDOFF.md remain deferred:
 
 - **Llama-3.2-3B → 1B headline runs** (~2-3 weeks on H100×4-8): all four scripts ready, gated-model access required.
 - **Baseline reproductions** (DistiLLM, MiniLLM, GKD on Llama-3.2): templates in `scripts/repro_baselines/` ready, share `_common.py` for matched arch/corpus/optimizer.
-- **lm-evaluation-harness eval** on the trained students: wrapper in `scripts/eval_harness.py`.
+- **lm-evaluation-harness eval** on the trained students: wrapper in `scripts/fsd/eval_harness.py`.
 - **Multi-GPU profiling** (TODO #6, 1-2 days of refactor): `fasd_profile` is currently single-GPU; the calibration shard-and-gather pattern is documented in HANDOFF.md.
-- **3-seed × 3-token-budget × 5-baseline ablation grid**: driver script `scripts/fsd_ablation_grid.py` ready; ~150-200 H100-days as planned.
+- **3-seed × 3-token-budget × 5-baseline ablation grid**: driver script `scripts/fsd/fsd_ablation_grid.py` ready; ~150-200 H100-days as planned.
 
 ## Next steps for the user
 
 1. **Verify locally** by running `python -m pytest tests/ -q` (≤12 seconds, all 211 should pass).
-2. **Reproduce the smoke** with `PYTHONPATH=. python scripts/fsd_headline_experiment.py --steps 300 --output runs/repro.json` (~5 minutes on a single A10G or better).
+2. **Reproduce the smoke** with `PYTHONPATH=. python scripts/fsd/fsd_headline_experiment.py --steps 300 --output runs/repro.json` (~5 minutes on a single A10G or better).
 3. **Launch the headline runs** when H100 capacity is available, starting with seed 0 at 10B tokens to verify pipeline before fanning out.
 4. **Walk through Decision Gates A–D** in HANDOFF.md as each sprint's results land. Each gate has a documented fallback so a failure doesn't kill the paper.
 
