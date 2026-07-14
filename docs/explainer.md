@@ -1,152 +1,153 @@
 # substill, explained from scratch
 
 *A plain-language walkthrough for readers new to model compression and knowledge
-distillation. No prior familiarity with these algorithms is assumed. For how the method
-works, see [concepts](concepts.md); for the numbers, see [benchmarks](benchmarks.md).*
+distillation. It assumes no background. For the method in depth, see
+[concepts](concepts.md); for the numbers and their controls, see
+[benchmarks](benchmarks.md).*
 
----
+## The problem
 
-## The problem in one paragraph
+Modern neural networks are big and expensive to run. A 3-billion-parameter language model
+needs a lot of memory and energy for every single prediction, and often you want something
+smaller that behaves almost the same: cheap enough to serve at high traffic, or small
+enough to fit on a phone, while staying nearly as accurate.
 
-Modern neural networks — the large language models behind chat assistants, the vision
-models behind image search — are **big and expensive to run**. A 3-billion-parameter model
-needs a lot of memory and energy for every single prediction. Often you want a **smaller
-model that behaves almost like the big one**: cheaper to serve, fast enough for a phone or a
-high-traffic API, but nearly as accurate. The big model is the **teacher**; the small one we
-build is the **student**. Producing a good student is the goal of *model compression* and
-*knowledge distillation*. FASD is a method for doing this unusually well — and, as of this
-work, it does it for **both language models and vision models** with the same core idea.
+The usual framing calls the big model the **teacher** and the small one the **student**.
+Building a good student is what *model compression* and *knowledge distillation* are for.
+`substill` is a particular way of doing it.
 
----
+## The insight: a trained network doesn't use all of itself
 
-## The key insight: a trained network doesn't use all of itself
+Everything rests on one observation.
 
-Here is the observation everything rests on.
+Take a layer in a trained network with, say, 768 "channels". Think of them as 768 dials
+the layer can turn. You might assume all 768 carry independent, useful information. They
+don't. Once the network is trained, the activations that layer actually produces tend to
+live in a much *smaller* space. Perhaps only 200 of those 768 directions carry real
+signal; the rest are close to redundant. The layer has 768 dials, but it effectively turns
+about 200 knobs.
 
-A layer in a trained network has, say, 768 "channels" (think of them as 768 dials it can
-turn). You might assume all 768 carry independent, important information. **They don't.**
-After training, the activations a layer actually produces tend to live in a much
-*smaller* space — maybe only 200 of those 768 directions carry real signal, and the rest are
-near-redundant noise. The network has 768 dials, but it effectively turns only ~200 knobs.
+> **An analogy.** Picture a 768-piece orchestra in which, for the music actually being
+> played, only about 200 instruments ever play a distinct part. The other 568 just double
+> notes already covered. Send most of them home and the sound barely changes.
 
-> **Analogy.** Imagine a 768-piece orchestra where, for the music actually being played, only
-> ~200 instruments ever play distinct parts and the other ~568 just double notes already
-> covered. You could send most of those musicians home and barely change the sound.
+That smaller, genuinely-used space is the **activation subspace**. The whole strategy is
+to find the subspace the teacher actually uses, and build the student to live in exactly
+that space, instead of compressing blindly channel by channel.
 
-That smaller, genuinely-used space is the **activation subspace**. FASD's entire strategy is:
-**find the subspace each part of the teacher actually uses, and build the student to live in
-exactly that space** — instead of compressing blindly, channel by channel.
+Finding it is not exotic. Run a little representative data through the frozen teacher and
+watch the activations, then compute the directions that carry statistically real signal.
+(The standard tool for this is PCA, plus a noise-floor cutoff so you keep signal and drop
+noise.)
 
-How do we find it? We run a bit of representative data through the frozen teacher, watch the
-activations, and compute the directions that carry real, statistically-distinguishable signal
-(a standard tool called PCA, plus a noise-floor cutoff so we keep signal and drop noise). The
-number of directions we keep is the layer's **behavioral rank** — how many knobs it really
-uses.
+## Idea one: restrict the teacher instead of rebuilding it
 
----
+Most compression methods pick which channels to keep, then *refit* the remaining weights,
+either training them from random initialization or regressing them against the teacher's
+activations. Both run into the same wall: the pieces you kept were tuned to work alongside
+the pieces you threw away.
 
-## Why where you *start* matters: "absorbed initialization"
+`substill` does something different. It doesn't fit new weights at all. Given a basis `V`
+for the subspace worth keeping, it *restricts* each of the teacher's weight matrices onto
+that subspace:
 
-Most compression methods build the small student with **random** weights and then train it to
-imitate the teacher from scratch. That's like asking someone to copy a painting starting from
-a blank canvas — possible, but slow and rarely faithful.
+```
+W_s = Vᵀ W V
+```
 
-FASD instead **starts the student inside the teacher's subspace** and **folds the teacher's
-own weights into it**. Concretely, if the teacher's weight matrix is `W`, and `V` is the basis
-for the subspace we're keeping, the student starts with `Vᵀ W V` — the teacher's exact
-behavior, *projected onto the directions that matter*. This is called **absorbed
-initialization**.
+This is not a new matrix fitted to data. It is the teacher's own weight, viewed in fewer
+coordinates. And because every layer is restricted with the *same* `V`, the student's
+layers still compose the way the teacher's did. The teacher's behavior is preserved
+structurally rather than approximated.
 
-> **Analogy.** Instead of a blank canvas, you start from a high-quality *photograph* of the
-> original painting and only touch up the details. You begin most of the way there.
+> **An analogy.** Rather than copying a painting onto a blank canvas, you start from a
+> photograph of the original and touch up the details. You begin most of the way there.
 
-**This is FASD's most important, most reproducible win** — and it shows up on both kinds of
-models we tested:
+The principle in one line: **restrict the teacher's operator; never refit it.**
 
-- **Language (GPT-2 on WikiText-2):** at matched size, a student that starts random reaches
-  ~1038 perplexity; a student with absorbed-init reaches **559** (lower is better) — roughly
-  **1.9× better**, just from where it started.
-- **Vision (ResNet-50 on CIFAR-10):** a random-init student reaches 64.8% accuracy; the
-  absorbed-init student reaches **81.1%** — a **+16 point** jump at the same compression.
+## Idea two: don't guess the subspace, learn it
 
-Same idea, two very different model families. That breadth is the headline.
+That leaves the real question. *Which* subspace should you keep?
 
----
+Every prior method answers it up front, with a frozen rule: take the highest-variance
+directions, or the ones with the best influence score, or the ones that minimize
+reconstruction error. Each of those is a *surrogate*. It optimizes a proxy for the
+student's quality rather than the quality itself, and then never revisits the choice.
 
-## What CPSD adds (and an honest account of what's proven)
+`substill`'s central move is to stop guessing and **train `V` directly against the
+distillation loss, through the whole network**. The basis becomes a parameter. It lives on
+the Stiefel manifold (the set of valid orthonormal frames), and a Riemannian optimizer
+rotates it, keeping it a legal basis at every step while gradient descent steers it toward
+the subspace that genuinely minimizes the loss.
 
-The novel research layer on top of absorbed-init is **CPSD — Circuit-Preserving Subspace
-Distillation**. It has three ideas; we report each honestly, including where it doesn't (yet)
-pay off.
+This finds things a frozen rule cannot. Consider a direction that contributes almost
+nothing to the output on its own, but that layer 3 needs in order to compute what layer 9
+eventually writes. A frozen, output-linearized criterion scores it as unimportant and
+discards it. Training through the network keeps it.
 
-1. **MT — manifold-trained factors.** Instead of freezing the subspace we picked, let the
-   student *gently rotate* its subspace during training to better fit the teacher, while
-   keeping the teacher's weights frozen inside it. (The "manifold" is the mathematical set of
-   valid rotations; we train on it with a specialized optimizer.) *Status: a modest but real win.*
-   At first it actually **lost** to the simpler frozen approach — the rotating subspace had too
-   little freedom to adapt. We diagnosed that, gave each factor a small extra "free core" of
-   adjustable weights (which costs nothing at inference), and it flipped to a small win (546.6 vs
-   558.9 perplexity, and *steadier* across runs). A good example of how an honest negative, once
-   understood, becomes an improvement.
+That method is **Learned Restriction Distillation (LRD)**, and it is what `substill`
+recommends you use.
 
-2. **DDR — distillation-driven differentiable rank.** Rather than fixing in advance how many
-   directions each layer keeps, **let the model learn the right number** — driven by the
-   distillation loss itself, under a global size budget. The contrast with a well-known
-   competitor (Dobi-SVD) is sharp: Dobi-SVD picks ranks to minimize *reconstruction error*;
-   we pick them to minimize *what the student gets wrong relative to the teacher*. *Status:
-   our distillation-driven rank beats the reconstruction-driven approach by 1.4–2.2× in our
-   matched comparison — a real win for the idea.*
+## What the numbers say
 
-3. **CPI — circuit-preserving initialization.** An attempt to align the student's attention
-   "circuits" with the teacher's at init. *Status: an honest negative result — it did not beat
-   the simpler baseline on a real model. We document it as a negative so others don't repeat
-   it.*
+On WikiText-2 perplexity, where lower is better, LRD beats the strongest frozen-basis
+baseline (PCA) by **6.8%**, at matched compute, over 3 seeds (95% CI [-8.4, -4.8] PPL, Welch p=0.002). That is a large gap,
+and every LRD seed beat every baseline seed.
 
-We keep the negatives visible on purpose: a method you can trust is one whose authors tell you
-where it doesn't work.
+The comparison is unusually tight. The control arm runs LRD's exact code path with the
+rotation learning rate set to zero, which reproduces the PCA baseline. So the only thing
+that changes between the two arms is whether `V` is allowed to move, and turning that one
+coordinate on is worth 5.8 points of perplexity.
 
----
+The margin also *grows* with the teacher. It reaches 16.8% on a 2.7B-parameter teacher,
+and the training gets steadier at scale rather than shakier. Against the recent wave of
+SVD-based compression methods, LRD beats the best of them (AIR) by 5.7%, which is the
+result you'd predict from the argument above: those methods all climb a frozen proxy, and
+that proxy turns out not to predict distilled quality.
 
-## Why it works on vision too
+The [benchmarks](benchmarks.md) page has the full tables, along with the controls and the
+commands to reproduce them.
 
-Nothing above is specific to language. A convolution is just a linear operation on image
-channels, so the *same* "project onto the used subspace, absorb the teacher's weights" math
-applies — we simply narrow the channels each layer uses. We compress a ResNet's internal
-"bottleneck" channels while leaving the connections between blocks intact, so the network
-still fits together. The result (the +16 accuracy points above) shows the core idea is a
-*general principle*, not an LLM trick. Most compression papers cover one or the other; FASD
-spans both.
+## Does it work outside language models?
 
----
+Partly, and the way it fails is informative.
 
-## Why this matters — the implications
+Restriction depends on the network having a *rotation-equivariant* residual stream. That
+is true of RMSNorm transformer decoders such as Llama and Mistral. It is not true of a
+ReLU convolutional network, where only channel *selection* commutes with the
+nonlinearity, not rotation.
 
-- **Cheaper, faster models without starting over.** Because the student begins from the
-  teacher's own behavior, it reaches good quality with far less training than random-init
-  distillation — saving compute, time, and money.
-- **Zero inference overhead.** All the clever factored/trained machinery **folds back into
-  ordinary layers** before deployment. The shipped student is a plain, fast model — none of
-  the training-time complexity remains at run time.
-- **One method, many model families.** The same pipeline compresses LLMs *and* CNNs. As models
-  proliferate, a general compression principle is more valuable than a per-architecture hack.
-- **Honest, measurable claims.** Every number here was produced by a reproducible script
-  (`scripts/cpsd/cpsd_compare.py`, `scripts/vision/resnet50_distill.py`) on real hardware, with seeds and
-  baselines — including the comparisons we *lose* or only tie.
+So on a ResNet-50, you can still select the teacher's behaviorally important channels and
+absorb its weights into them, and that works: it beats random initialization by around 8
+points of accuracy on CIFAR-10. But you cannot *rotate* the subspace, and sure enough, the
+learned-rotation variant does no better than plain selection there.
 
----
+That is a useful negative. It means the transformer win comes specifically from
+rotating the subspace, not merely from selecting it. The vision arm isolates the mechanism
+by being the case where the mechanism is unavailable.
 
-## Where we stand, in one honest sentence
+## What we know, and what we don't
 
-FASD's absorbed-initialization beats naive distillation baselines clearly and reproducibly on
-both language and vision; its distillation-driven rank beats a real competitor mechanism
-(Dobi-SVD); and the full novel method now *modestly* beats even our own strong absorbed-init
-baseline (after the free-core fix). The decisive head-to-head against *published* state-of-the-art
-on a large model is the next milestone, not a finished claim.
+This project has retracted its own headline before, and it's worth being direct about
+that. An earlier method here (FSD/CPSD) reported large gains that did not survive
+re-measurement: once compute was matched and the baseline's learning rate was tuned, the
+advantage went away. The audit also turned up a bug in our own pipeline that had been
+silently feeding every one of those students a truncated, unprofiled basis.
 
----
+LRD is the method that came through that process intact, and the numbers above are stated
+with the controls that isolate the win. The full account, including the bugs we found in
+our own baselines, is in the [re-measurement audit](init_findings.md). Read it before
+citing any number from this project.
+
+What remains open: LRD is verified on Llama-family decoders up to 2.7B parameters, on
+WikiText-2, at short training budgets. A decisive head-to-head against published
+state-of-the-art on a large model, at a full training budget, is the next milestone rather
+than a finished claim.
 
 ## Where to go next
 
-- **Run it:** the [user guide](guide.md) — the LRD one-call API, config, and the vision path.
-- **Understand it:** the [concepts](concepts.md) page — the restriction principle in depth.
-- **The evidence:** the [benchmarks](benchmarks.md), and the full [LRD study](learned_restriction.md).
+To run it, the [user guide](guide.md) covers the one-call API, the configuration options,
+and the vision path. To understand it properly, [concepts](concepts.md) gives the
+restriction principle in depth. To check the evidence, start with the
+[benchmarks](benchmarks.md), then the full [LRD study](learned_restriction.md) and the
+[audit](init_findings.md).

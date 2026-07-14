@@ -1,9 +1,9 @@
 # Adding a new model architecture
 
 FSD/CPSD is architecture-agnostic via the declarative `ArchitectureSpec`
-(`substill/arch/spec.py`). Adding a model family is **data, not code** — no new
-`_detect_*`/`_build_*`/`fold_*` functions. This replaces the old ~200-line-per-arch
-forks (the "3–5 days per architecture" problem).
+(`substill/arch/spec.py`). Adding a model family means writing **data, not code**: no new
+`_detect_*`/`_build_*`/`fold_*` functions, and none of the old ~200-line-per-arch forks that
+created the "3–5 days per architecture" problem.
 
 ## The 4-step checklist
 
@@ -65,9 +65,9 @@ moe = MoESpec(
     expert_edge_kinds=("ffn.gate", "ffn.up", "ffn.down"),
 )
 ```
-The interpreter enumerates one branch per `(expert, edge_kind)` — this is the surface
-for per-expert rank allocation (DDR). Note: on recent `transformers` the experts are a
-*fused* batched tensor (not a `ModuleList`); branch *enumeration* works, but the absorbed
+The interpreter enumerates one branch per `(expert, edge_kind)`, which is the surface for
+per-expert rank allocation (DDR). One caveat: on recent `transformers` the experts are a
+*fused* batched tensor rather than a `ModuleList`. Branch *enumeration* works; the absorbed
 *build* on the fused tensor layout is the remaining builder work (see HANDOFF / task #11).
 
 ### 3. Verify branch detection

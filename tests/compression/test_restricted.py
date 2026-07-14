@@ -138,6 +138,40 @@ def test_zero_residual_is_the_plain_restriction():
         assert torch.allclose(rf(ids).logits, rp(ids).logits, atol=1e-5)
 
 
+def test_hidden_and_logits_match_forward_and_expose_the_stream():
+    """`hidden_and_logits` must return the same logits as `forward`, plus the per-layer
+    ``(L, B, T, k)`` student stream used by the restriction-consistency aux loss."""
+    rf, calib = _restricted_free()
+    torch.manual_seed(4)
+    with torch.no_grad():          # a non-trivial residual so the two paths could diverge
+        for p in rf.D.values():
+            p.normal_(0, 0.02)
+        rf.D_emb.normal_(0, 0.02)
+        rf.D_lm.normal_(0, 0.02)
+    ids = calib[0]["input_ids"]
+    L = rf.teacher[0].config.num_hidden_layers
+    with torch.no_grad():
+        ref = rf(ids).logits
+        out, hs = rf.hidden_and_logits(ids)
+    assert torch.allclose(out.logits, ref, atol=1e-5), (out.logits - ref).abs().max()
+    assert hs.shape == (L, ids.shape[0], ids.shape[1], rf.k)
+
+
+def test_restriction_consistency_is_differentiable_in_V():
+    """The cosine consistency term must push gradient back into ``V`` on both sides."""
+    from substill.lrd import _restriction_consistency
+
+    rf, calib = _restricted_free()
+    ids = calib[0]["input_ids"]
+    teacher = rf.teacher[0]
+    t_hidden = teacher(input_ids=ids, output_hidden_states=True).hidden_states
+    _, hs = rf.hidden_and_logits(ids)
+    aux = _restriction_consistency(rf.V, hs, t_hidden)
+    assert 0.0 <= float(aux.detach()) <= 2.0
+    aux.backward()
+    assert rf.V.grad is not None and rf.V.grad.abs().sum() > 0
+
+
 def test_free_fold_is_function_identical_with_nonzero_residual():
     """`fold()` must add ``D`` into every weight it belongs to -- including the embedding
     and the unembedding, which the forward pass handles on the side and never materializes."""

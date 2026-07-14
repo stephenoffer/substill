@@ -36,6 +36,7 @@ transfers through distillation; replacement does not, on either architecture.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 
 import torch
@@ -44,13 +45,59 @@ from torch import Tensor
 
 __all__ = [
     "gamma_fold_llama",
+    "untie_lm_head",
+    "check_head_geometry",
     "build_narrow_llama",
     "absorb_llama",
     "llama_residual_second_moment",
+    "llama_norm_input_second_moments",
     "rms_gain",
     "gap_fit_llama",
     "llama_logit_metric",
 ]
+
+
+def check_head_geometry(teacher: nn.Module, n_head: int, n_kv: int) -> None:
+    """Raise unless ``(n_head, n_kv)`` preserves the teacher's grouped-query group size.
+
+    Under GQA a query head does not stand alone: teacher query head ``i`` was trained to
+    attend against key/value head ``i // G``, for the teacher's group size
+    ``G = n_head / n_kv``. `absorb_llama` copies teacher q head ``i`` and teacher kv head
+    ``j`` into the student *verbatim*, and the student's attention then re-derives the
+    pairing from **its own** ``G' = n_head' / n_kv'``. Unless ``G' == G``, student q head
+    ``i`` attends against a kv head whose keys its query weights have never seen: the student
+    is not the teacher seen through a subspace, it is a different operator, and the premise
+    of the whole method is void.
+
+    Nothing about this fails loudly -- the shapes are all valid, the KD loss still descends,
+    and the student still folds. It surfaces only as quality that is quietly worse than it
+    should be, and only on GQA teachers (Llama-3, Mistral, Qwen). Every teacher benchmarked
+    in ``docs/learned_restriction.md`` is MHA (``G == 1``), where the constraint is vacuous,
+    which is why it went unnoticed. Hence this guard, called from both
+    :class:`~substill.compression.restricted.RestrictedLlama` and `absorb_llama`.
+    """
+    c = teacher.config
+    heads = int(c.num_attention_heads)
+    kv_heads = int(getattr(c, "num_key_value_heads", heads))
+    if heads % kv_heads != 0:
+        raise ValueError(
+            f"teacher's {heads} query heads do not partition over {kv_heads} kv heads")
+    group = heads // kv_heads
+    if not 1 <= n_kv <= kv_heads or not 1 <= n_head <= heads:
+        raise ValueError(
+            f"student heads out of range: n_head={n_head} (teacher has {heads}), "
+            f"n_kv={n_kv} (teacher has {kv_heads})")
+    if n_head != group * n_kv:
+        got = n_head / n_kv
+        raise ValueError(
+            f"n_head={n_head}, n_kv={n_kv} gives the student {got:g} queries per kv head, but "
+            f"the teacher has {group}. The restriction copies teacher q head i and teacher kv "
+            f"head j verbatim, so the student would attend q head i against kv head "
+            f"i//{got:g} while the teacher trained it against kv head i//{group} -- that is a "
+            f"different operator, not a restriction of the teacher. "
+            f"Keep whole groups: n_head = {group} * n_kv (here n_kv={n_kv} -> "
+            f"n_head={group * n_kv})."
+        )
 
 
 @torch.no_grad()
@@ -68,6 +115,45 @@ def llama_logit_metric(teacher: nn.Module) -> Tensor:
 
 
 @torch.no_grad()
+def untie_lm_head(model: nn.Module) -> nn.Module:
+    """Give ``model`` an ``lm_head`` that is a *separate tensor* from the input embedding.
+
+    Mutates and returns ``model`` (call it on a copy). A no-op when the head is already
+    untied.
+
+    Weight tying is not a detail here, it is a correctness precondition. When
+    ``tie_word_embeddings`` is set, HuggingFace makes ``lm_head.weight`` **the same
+    ``nn.Parameter`` object** as ``embed_tokens.weight`` -- not a copy. Any in-place write to
+    the head therefore rewrites the embedding as a side effect. `gamma_fold_llama` folds the
+    final norm's gain into the head; on a tied teacher that silently rescales the embedding
+    too and the "function-preserving" fold changes the teacher's function (measured: 20%
+    relative logit error on a tied toy Llama; pinned by
+    ``tests/compression/test_lrd_soundness.py``).
+
+    Untying is itself exactly function-preserving -- it only stops two roles from sharing one
+    tensor -- so it is always safe to do first. Llama-3.2-1B/3B and most small Llamas ship
+    tied, so this is the common case, not the exotic one.
+    """
+    emb = model.get_input_embeddings()
+    head = model.get_output_embeddings()
+    if head is None or head.weight.data_ptr() != emb.weight.data_ptr():
+        return model
+    head.weight = nn.Parameter(emb.weight.detach().clone(),
+                               requires_grad=emb.weight.requires_grad)
+    model.config.tie_word_embeddings = False
+    if hasattr(model.config, "get_text_config"):
+        # Nested (multimodal) configs carry their own copy of the flag.
+        with contextlib.suppress(Exception):
+            model.config.get_text_config().tie_word_embeddings = False
+    # Stop `tie_weights()` (called by `.from_pretrained`, `.save_pretrained`, `resize_*`)
+    # from re-tying them behind our back.
+    keys = getattr(type(model), "_tied_weights_keys", None)
+    if keys is not None:
+        model._tied_weights_keys = [] if isinstance(keys, (list, tuple)) else {}
+    return model
+
+
+@torch.no_grad()
 def gamma_fold_llama(teacher: nn.Module) -> nn.Module:
     """Fold every RMSNorm's diagonal gain into the linear that consumes it.
 
@@ -76,10 +162,13 @@ def gamma_fold_llama(teacher: nn.Module) -> nn.Module:
     ``V^T diag(g) V`` -- the gain lives inside q/k/v (and gate/up, and ``lm_head``),
     where the absorbed projection handles it exactly.
 
-    Unlike GPT-2, the final norm can be folded here: ``lm_head`` is untied, so scaling
-    it does not corrupt the input embedding.
+    The final norm folds into ``lm_head``, which is only legitimate once the head is a
+    tensor of its own: on a **tied** teacher the head *is* the input embedding, and scaling
+    it corrupts the embedding. `untie_lm_head` is therefore run first, on the copy. (This is
+    the same tied-embedding obstruction SliceGPT hits on GPT-2 -- there it blocks the
+    mean-removal fold; here it would silently poison the gamma fold.)
     """
-    t = copy.deepcopy(teacher)
+    t = untie_lm_head(copy.deepcopy(teacher))
     for layer in t.model.layers:
         g = layer.input_layernorm.weight.detach().clone()
         for lin in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
@@ -112,6 +201,99 @@ def llama_residual_second_moment(teacher, calib, *, device="cuda") -> Tensor:
             acc += x.T @ x
             n += x.shape[0]
     return (acc / max(n, 1)).float()
+
+
+def norm_param_names(teacher: nn.Module) -> list[str]:
+    """The student parameter names of every RMSNorm, in forward order.
+
+    ``2L + 1`` of them: each block's ``input_layernorm`` and ``post_attention_layernorm``,
+    then the final ``norm``.
+    """
+    names = []
+    for li in range(int(teacher.config.num_hidden_layers)):
+        names.append(f"layers.{li}.input_layernorm.weight")
+        names.append(f"layers.{li}.post_attention_layernorm.weight")
+    names.append("norm.weight")
+    return names
+
+
+@torch.no_grad()
+def llama_norm_input_second_moments(teacher, calib, *, device="cuda") -> Tensor:
+    """``E[h h^T]`` at the input of *each* RMSNorm: a ``(2L+1, d, d)`` stack.
+
+    `llama_residual_second_moment` pools every residual state into one matrix. That is the
+    right object for choosing a *single shared* basis ``V``, but it is the wrong object for
+    the norm gains, which are ``2L+1`` *separate* scalars sitting at ``2L+1`` different
+    points in the network. The residual stream's energy and its alignment with ``V`` both
+    change sharply with depth -- most sharply between the raw embedding and everything after
+    it -- and the pooled moment, being dominated by the high-norm deep layers, describes none
+    of them well. Measured on ``JackFram/llama-160m`` at 3.07x: the single pooled gain is
+    **39% too large at layer 0's norms** and 1-5% off at the other 23.
+
+    Memory is ``(2L+1) * d^2 * 4`` bytes (59 MB on llama-160m; 1.7 GB on a 2560-wide, 32-layer
+    teacher). :attr:`substill.LRDConfig.per_norm_gain` turns this off and falls back to the
+    single pooled gain when that does not fit.
+
+    Accumulated in **fp32**, unlike `llama_residual_second_moment`'s fp64. The pooled moment is
+    eigendecomposed to choose the basis, where conditioning matters; these are only ever
+    contracted to the trace ratio ``<S_l, V V^T> / tr(S_l)``, whose fp32 error is ~1e-6 --
+    irrelevant to a gain, and worth halving a transient that would otherwise be 3.4 GB on a
+    2.7B teacher.
+    """
+    teacher = teacher.to(device).eval()
+    d = int(teacher.config.hidden_size)
+    names = norm_param_names(teacher)
+    acc = torch.zeros(len(names), d, d, dtype=torch.float32, device=device)
+    n = torch.zeros(len(names), dtype=torch.float64, device=device)
+
+    def mk(i):
+        def pre(_m, inp):
+            x = inp[0].detach().to(device).float().reshape(-1, d)
+            acc[i] += x.T @ x
+            n[i] += x.shape[0]
+        return pre
+
+    mods = [m for layer in teacher.model.layers
+            for m in (layer.input_layernorm, layer.post_attention_layernorm)]
+    mods.append(teacher.model.norm)
+    hooks = [m.register_forward_pre_hook(mk(i)) for i, m in enumerate(mods)]
+    for b in calib:
+        teacher(input_ids=b["input_ids"].to(device))
+    for h in hooks:
+        h.remove()
+    return acc / n.clamp_min(1).float().view(-1, 1, 1)
+
+
+@torch.no_grad()
+def llama_balanced_second_moment(teacher, calib, *, device="cuda") -> Tensor:
+    """``E[h h^T]`` pooled over the residual stream with each layer weighted **equally**.
+
+    `llama_residual_second_moment` *sums* the raw second moment of every residual state. But a
+    transformer's residual norm grows steeply with depth -- often by an order of magnitude -- and
+    a sum is dominated by its largest terms. So the "activation covariance" the whole
+    subspace-compression literature (and this library) computes is, in effect, the covariance of
+    the **last few layers**, and the shared basis it induces barely sees the early ones. Measured
+    on ``JackFram/llama-160m`` at 3.07x: the resulting PCA basis retains **97.8% of the pooled
+    energy but only ~51% of the embedding's**.
+
+    Nothing about that is intended. It is an artifact of adding together quantities with wildly
+    different scales. Normalizing each layer's moment by its own trace before averaging asks the
+    question that was meant all along -- *which subspace serves every layer* -- and it is a
+    one-line change:
+
+        S_balanced = mean_l  S_l / tr(S_l)
+
+    It is worth more than any other single fix in ``docs/learned_restriction.md`` §9-§11: the
+    absorbed init improves 4.6x (17,529 -> 3,840 PPL), and the **frozen-basis baseline** gains
+    **4.5 PPL** of final quality (79.46 -> 74.94, n=3), which is most of the margin LRD's entire
+    Stiefel machinery was reported to buy. See §11.
+
+    Uses the ``2L+1`` norm inputs as its sample of the stream (the points the student's geometry
+    actually cares about), so it costs the same pass as `llama_norm_input_second_moments`.
+    """
+    nS = llama_norm_input_second_moments(teacher, calib, device=device)
+    tr = nS.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(1e-12)
+    return (nS / tr.view(-1, 1, 1)).mean(0)
 
 
 @torch.no_grad()
@@ -158,12 +340,14 @@ def build_narrow_llama(teacher, k: int, interm: int, n_head: int, n_kv: int):
 
 @torch.no_grad()
 def absorb_llama(teacher, student, V: Tensor, interm_bases: list[Tensor],
-                 *, norm_gain: float = 1.0) -> None:
+                 *, norm_gain: float | dict[str, float] = 1.0) -> None:
     """``W_s = V_out^T W V_in`` for every weight of a narrow Llama.
 
     ``teacher`` must already be gamma-folded. Attention heads are kept whole: the student
     inherits the teacher's first ``n_head`` heads (and first ``n_kv`` kv-heads), which is
-    the arbitrary choice `docs/init_findings.md` §9a-9b found no rule beats.
+    the arbitrary choice `docs/init_findings.md` §9a-9b found no rule beats. Taking both as
+    *prefixes* is what makes the query/kv pairing survive -- but only when the student keeps
+    the teacher's group size, which `check_head_geometry` enforces.
     """
     dev = V.device
     V = V.float()
@@ -171,6 +355,7 @@ def absorb_llama(teacher, student, V: Tensor, interm_bases: list[Tensor],
     tc, sc = t.config, s.config
     head_dim = int(tc.hidden_size) // int(tc.num_attention_heads)
     nh, nkv = int(sc.num_attention_heads), int(sc.num_key_value_heads)
+    check_head_geometry(t, nh, nkv)
     q_rows, kv_rows = nh * head_dim, nkv * head_dim
 
     s.model.embed_tokens.weight.data.copy_(t.model.embed_tokens.weight.detach().to(dev).float() @ V)
@@ -192,10 +377,18 @@ def absorb_llama(teacher, student, V: Tensor, interm_bases: list[Tensor],
         sm.down_proj.weight.data.copy_(V.T @ tm.down_proj.weight.detach().to(dev).float() @ E)
 
         # Norms are affine-free after the gamma fold; `norm_gain` restores the scale the
-        # truncated stream loses (see `rms_gain`).
-        sl.input_layernorm.weight.data.fill_(norm_gain)
-        sl.post_attention_layernorm.weight.data.fill_(norm_gain)
-    s.model.norm.weight.data.fill_(norm_gain)
+        # truncated stream loses (see `rms_gain`). A dict gives each norm its own gain, the
+        # scale its *own* input distribution loses (see `llama_norm_input_second_moments`);
+        # a float applies one pooled gain to all of them.
+        sl.input_layernorm.weight.data.fill_(
+            _gain_at(norm_gain, f"layers.{i}.input_layernorm.weight"))
+        sl.post_attention_layernorm.weight.data.fill_(
+            _gain_at(norm_gain, f"layers.{i}.post_attention_layernorm.weight"))
+    s.model.norm.weight.data.fill_(_gain_at(norm_gain, "norm.weight"))
+
+
+def _gain_at(norm_gain: float | dict[str, float], name: str) -> float:
+    return float(norm_gain[name] if isinstance(norm_gain, dict) else norm_gain)
 
 
 # ---------------------------------------------------------------------------
