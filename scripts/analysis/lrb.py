@@ -89,6 +89,16 @@ def load(args):
     return teacher, chunk("train"), chunk("validation")[: args.eval_batches]
 
 
+# This driver exists to *reproduce* the published numbers in
+# `docs/learned_restriction.md`, so it must keep using the Stiefel step those numbers were
+# measured with: a raw ambient Adam step with a sign-fixed QR retraction. `StiefelAdamV` now
+# defaults to a trust-region step (the LR *is* the rotation per step) and a polar retraction,
+# which are better on every axis (§9c) but are a different optimizer -- silently adopting them
+# here would mean this script no longer reproduces what it claims to.
+# New work should use the defaults; see `scripts/analysis/lrd_validate.py`.
+_LEGACY_STIEFEL = {"trust_region": False, "retraction": "qr"}
+
+
 def cosine_warmup(opt, steps, warm_frac=0.1, floor=0.0):
     """Linear warmup then cosine decay to ``floor`` (a fraction of peak, default 0).
 
@@ -119,7 +129,7 @@ def train_restriction(teacher, rm, train, *, steps, lr, seed, device, kd="forwar
                       offset=0):
     """Phase 1: descend the KD loss on the Grassmannian. ``V`` is the only parameter."""
     rm.train()
-    opt = StiefelAdamV([rm.V], lr=lr)
+    opt = StiefelAdamV([rm.V], lr=lr, **_LEGACY_STIEFEL)
     sched = cosine_warmup(opt, steps)
     for ids in _batches(train, steps, seed, offset):
         ids = ids.to(device)
@@ -162,7 +172,7 @@ def train_joint(teacher, rm, train, *, steps, lr, v_lr, seed, device, kd="forwar
     """
     rm.train()
     stiefel, euclid = rm.param_groups()
-    opt_v = StiefelAdamV(stiefel, lr=v_lr)
+    opt_v = StiefelAdamV(stiefel, lr=v_lr, **_LEGACY_STIEFEL)
     opt_d = torch.optim.AdamW(euclid, lr=lr, weight_decay=0.01)
     sch_v = cosine_warmup(opt_v, steps, floor=v_floor)
     sch_d = cosine_warmup(opt_d, steps)
@@ -212,7 +222,7 @@ def train_amortized(teacher, student, rm, train, *, steps, lr, v_lr, refresh_eve
     student.train()
     opt = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=0.01)
     sched = cosine_warmup(opt, steps)
-    v_opt = StiefelAdamV([rm.V], lr=v_lr)
+    v_opt = StiefelAdamV([rm.V], lr=v_lr, **_LEGACY_STIEFEL)
     for step, ids in enumerate(_batches(train, steps, seed)):
         ids = ids.to(device)
         if v_lr > 0 and step > 0 and step % refresh_every == 0:

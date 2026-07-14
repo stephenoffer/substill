@@ -3,6 +3,9 @@
 Everything below is available directly on the top-level `substill` namespace
 (`import substill`).
 
+Most users need only the first section. The rest is there for building a custom pipeline,
+where every stage below is public and usable on its own.
+
 ## Learned Restriction Distillation (recommended)
 
 ```{eval-rst}

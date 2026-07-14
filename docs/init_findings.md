@@ -18,6 +18,33 @@ describe. The results below supersede them where they conflict.
 > generalize. Every GPT-2-only claim below should be read as provisional until repeated on
 > a Llama-family model. §10 says which ones have been.
 
+> ## ⚠ Correction, added 2026-07-13 by the soundness audit
+>
+> **§10b's headline — "six ways of choosing the basis were tried and not one beats plain PCA"
+> — is *true*, and it is true for a reason this document does not give.**
+>
+> All six criteria were computed from the **same** activation covariance, built by
+> `llama_residual_second_moment` as a *raw sum* over every residual state. A transformer's
+> residual energy grows by ~10⁵ from the embedding to the final norm (measured: **130,711×** on
+> llama-160m), and a sum is dominated by its largest terms. So the covariance every criterion
+> was reading is effectively the covariance of the **last few layers**: the basis it induces
+> keeps 97.8% of the pooled energy and only **50.9% of the embedding's**.
+>
+> Varying the *criterion* across six settings while holding that *statistic* fixed was rigorous
+> about the wrong axis. Six careful experiments over a broken input give six careful wrong
+> answers, and their agreement reads as robustness.
+>
+> Give every layer an equal vote (`S = mean_ℓ S_ℓ / tr(S_ℓ)`, one line) and **every criterion
+> improves by ~5–6 PPL at once** — 80.9 → 75.0 on llama-160m at 3.07×, n=6 — while their
+> *ranking* stays unchanged: activation SVD 74.96, activation+influence (AIR) 75.00,
+> activation-whitened (SVD-LLM) 74.97, a dead heat. So the finding survives in a sharper form:
+>
+> > **The choice of criterion does not matter. The covariance they all share does.**
+>
+> The corrected statistic is worth more than every basis-selection criterion in the 2024–2026
+> literature put together — and more than half of what LRD's Stiefel machinery was reported to
+> buy. See `learned_restriction.md` §11.
+
 ---
 
 ## 0. The bug underneath the old numbers
@@ -30,10 +57,10 @@ searches the profile for `block.residual`, finds nothing, and falls through to:
 return torch.eye(t_hidden, s_hidden)
 ```
 
-So every absorbed-init student ever built through `FSDPipeline` — including every
-CPSD result — used **identity truncation**: keep the first `s_hidden` residual
+So every absorbed-init student ever built through `FSDPipeline`, every CPSD result
+included, used **identity truncation**: keep the first `s_hidden` residual
 coordinates, discard the rest. The profile's residual statistics were never used.
-The same fallback fires from `fasd/compression/cpi.py`.
+`fasd/compression/cpi.py` hits the same fallback.
 
 Verified by `tests/test_seq_absorb.py::test_profile_default_yields_identity_residual_basis`.
 `_residual_basis` now warns loudly instead of falling through in silence.
@@ -42,14 +69,13 @@ At `k=324` that basis retains **10.8%** of the residual stream's variance and
 incurs **59%** relative logit error (`‖W(I−VVᵀ)h‖² / ‖Wh‖²`). For comparison, PCA
 retains 98.7% of variance at 0.12% logit error.
 
-**And on GPT-2 it is the best-performing basis we tested** (§2) — which is itself an
-artifact of GPT-2's LayerNorm and tied head. On an RMSNorm, untied-embedding model the
-profiled subspace is worth **16%** over this fallback, exactly as the original design
-intended (§10). The bug is real and costly on the architectures this library targets.
+**And on GPT-2 it is the best-performing basis we tested** (§2). That, too, is an
+artifact of GPT-2's LayerNorm and tied head. Swap to a model with RMSNorm and untied
+embeddings and the profiled subspace is worth **16%** over this fallback, exactly as the
+original design intended (§10). The bug is real, and costly on the architectures this
+library targets.
 
----
-
-## 1. Absorbed init compounds error catastrophically — and does not care
+## 1. Absorbed init compounds error catastrophically, and does not care
 
 Per-block relative drift `‖h_s − Vᵀh_t‖ / ‖Vᵀh_t‖`, measured on the student that
 `fasd.build_student(arch_multiplier=0.5, absorbed_init=True)` returns
@@ -62,15 +88,13 @@ Per-block relative drift `‖h_s − Vᵀh_t‖ / ‖Vᵀh_t‖`, measured on th
 By block 3 the error exceeds the signal. That student's initial PPL is **2.28×10⁶**;
 the equivalent construction in `scripts/analysis/bench.py` (identical residual basis, slightly
 different FFN-intermediate estimator) gives **6.99×10⁷**. Both are 40–1,300× worse than
-a *random* student at 5.4×10⁴, and the exact value is not meaningful — a single
-mis-scaled output direction dominates it.
+a *random* student at 5.4×10⁴. The exact value is not meaningful: a single mis-scaled
+output direction dominates it.
 
 Yet after distillation this initialization produces the best model in the table.
 Initialization fidelity is not what distillation exploits **on GPT-2**; §4d shows what is.
-On Llama, init PPL orders the bases exactly as final PPL does (§10) — so even this is
+On Llama, init PPL orders the bases exactly as final PPL does (§10). So even this is
 architecture-specific.
-
----
 
 ## 2. Ranking channels by importance is worse than not ranking them
 
@@ -86,46 +110,44 @@ in both, and no arm changes rank across them.
 | variance selection (`select`) | 96.7% | 0.0034 | 207.32 (n=1) | 180.57 ± 2.74 |
 | **identity truncation** | **10.8%** | **0.59** | **179.99 ± 2.39** | **161.00 ± 1.85** |
 
-Two mechanisms:
+Two mechanisms are at work.
 
-- **Rotations break LayerNorm.** GPT-2's residual stream carries a large mean /
-  outlier direction. The top principal component aligns with it, and LayerNorm
-  normalizes *across* coordinates, so the rotated stream collapses onto that one
-  coordinate. SliceGPT (2401.15024) escapes this by making the stream mean-zero and
-  converting LN → RMSNorm; that fold is unavailable here because GPT-2 ties
-  `lm_head` to `wte`, so the mean-removal that repairs the stream corrupts the
-  unembedding. We implemented and verified the γ-fold (function-preserving) and it
-  does not rescue the rotation.
-- **Importance ranking concentrates outliers.** GPT-2's residual stream is dominated by
-  a handful of coordinates: the single largest carries **73.7% of total variance**, the
-  top 4 carry 86.9%, and the max/median channel-variance ratio is **9,136×**. Ranking by
-  variance therefore hands LayerNorm — which normalizes *across* coordinates — a stream
-  where every coordinate is an outlier:
+Rotations break LayerNorm. GPT-2's residual stream carries a large mean / outlier
+direction. The top principal component aligns with it, and LayerNorm normalizes *across*
+coordinates, so the rotated stream collapses onto that one coordinate. SliceGPT
+(2401.15024) escapes this by making the stream mean-zero and converting LN → RMSNorm.
+That fold is unavailable here: GPT-2 ties `lm_head` to `wte`, so the mean-removal that
+repairs the stream corrupts the unembedding. We implemented and verified the γ-fold
+(function-preserving). It does not rescue the rotation.
 
-  | basis | mean variance of kept channels | max/mean |
-  |---|---|---|
-  | `select` (top-variance) | 188.7 | 247× |
-  | `identity` (first 324) | 21.2 | 167× |
-  | `random_sel` (arbitrary 324) | 12.7 | 109× |
+Importance ranking concentrates outliers. A handful of coordinates dominate GPT-2's
+residual stream. The single largest carries **73.7% of total variance**, the top 4 carry
+86.9%, and the max/median channel-variance ratio is **9,136×**. Ranking by variance
+therefore hands LayerNorm, which normalizes *across* coordinates, a stream where every
+coordinate is an outlier:
 
-  An arbitrary subset keeps a representative scale distribution; the importance-ranked
-  one does not. The same single dominant coordinate is why the top principal component
-  aligns with it and the rotation collapses. This is consistent with "Variance Is Not
-  Importance" (2604.20682), which reports the same for compression more generally.
+| basis | mean variance of kept channels | max/mean |
+|---|---|---|
+| `select` (top-variance) | 188.7 | 247× |
+| `identity` (first 324) | 21.2 | 167× |
+| `random_sel` (arbitrary 324) | 12.7 | 109× |
+
+An arbitrary subset keeps a representative scale distribution. The importance-ranked one
+does not. That same dominant coordinate is why the top principal component aligns with it
+and the rotation collapses. All of this is consistent with "Variance Is Not Importance"
+(2604.20682), which reports the same for compression more generally.
 
 Note the ordering is *inverted* against both variance retained and logit error. Neither
 statistic predicts post-distillation quality **here**.
 
-**§10 tests both bullets above and confirms the first.** On an RMSNorm, untied-embedding
-model of identical shape, the rotation stops diverging and wins by 16%, and the ordering
-becomes conventional — so the inversion is caused by LayerNorm's centering plus the tied
-head, exactly as claimed. The second bullet needs amending: Llama-160m's stream is *also*
-outlier-dominated (top coordinate 61.7% of variance) and shows no inversion, so outliers
-alone are not sufficient. They are only harmful once a *centering* normalizer sees them.
-What does survive both architectures is narrower: importance ranking never *beats* an
-arbitrary subset — worse on GPT-2, tied on Llama.
-
----
+**§10 tests both mechanisms and confirms the first.** Swap in a model of identical shape
+that uses RMSNorm and untied embeddings and the rotation stops diverging, wins by 16%, and
+the ordering becomes conventional. So the inversion is caused by LayerNorm's centering plus
+the tied head, exactly as claimed. The second mechanism needs amending. Llama-160m's stream is
+*also* outlier-dominated (top coordinate 61.7% of variance) and shows no inversion, so
+outliers alone are not sufficient; they are only harmful once a *centering* normalizer
+sees them. What survives both architectures is narrower. Importance ranking never *beats*
+an arbitrary subset: worse on GPT-2, tied on Llama.
 
 ## 3. A single learning rate silently reverses the ranking
 
@@ -143,8 +165,8 @@ and the gaps between arms shrink by ~3× as the LR approaches its optimum. Compa
 of initializations at one shared LR are not informative.
 
 The last row is the *worst* fit variant (§2 shows `select_gn` is a bad basis; §4a shows
-`graft` is a bad objective). The best variant — `identity` basis, L2 objective — reverses
-sign with the LR:
+`graft` is a bad objective). The best variant, `identity` basis with the L2 objective,
+reverses sign with the LR:
 
 | | sequential fit | absorbed init | verdict |
 |---|---|---|---|
@@ -154,8 +176,6 @@ sign with the LR:
 Note the fit is *better* at 1500 steps with the larger LR than at 2000 steps with the
 smaller one, so this is the LR, not the budget. One shared LR would have supported
 either conclusion. (Compute matching, §4, then settles it against the fit.)
-
----
 
 ## 4. Our proposed mechanism does not survive compute matching
 
@@ -168,8 +188,8 @@ claims:
 - it *generalizes*: held-out drift matches fit drift to <0.01, and 12× more
   calibration data (64 → 768 sequences) moves initial PPL by <1%. Not overfitting.
 
-And it loses. Wall-clock-matched, 3 seeds (`runs/bench_matched_s012.json`) — the
-fit costs 22.7s, which buys the baseline 499 extra distillation steps:
+And it loses. Wall-clock-matched, 3 seeds (`runs/bench_matched_s012.json`): the
+fit costs 22.7s, which buys the baseline 499 extra distillation steps.
 
 | arm | steps | final PPL | init s | KD s | total s |
 |---|---|---|---|---|---|
@@ -181,12 +201,12 @@ fit costs 22.7s, which buys the baseline 499 extra distillation steps:
 
 The 6%-at-equal-steps result was compute, not method.
 
-The matching is not exact — `absorbed` ends up with 93.4s against `sgca`'s 90.4s, a 3.3%
+The matching is not exact. `absorbed` ends up with 93.4s against `sgca`'s 90.4s, a 3.3%
 advantage *to the baseline*. That residual does not carry the conclusion: `sgca_anchored`
 consumed **96.6s, more than `absorbed`'s 93.4s**, and still lost by 6.8 PPL. Whichever way
 the few remaining seconds are assigned, the fit does not pay for itself.
 
-### 4a. RETRACTED — the graft objective is neutral, not harmful
+### 4a. RETRACTED: the graft objective is neutral, not harmful
 
 **This section previously claimed that optimizing the true KD loss locally is worse than a
 crude L2 surrogate (192.09 ± 1.60 vs 169.12 ± 3.36). That was our bug, not a result.**
@@ -194,7 +214,7 @@ crude L2 surrogate (192.09 ± 1.60 vs 169.12 ± 3.36). That was our bug, not a r
 `objective="graft"` splices the student block's output back into the teacher's residual
 stream (student coordinates from the student, discarded complement from the teacher), runs
 the frozen teacher tail, and backprops the actual logit KL. Its teacher targets were
-computed as `log_softmax(lm_head(ln_f(hidden_states[-1])))` — but HuggingFace's
+computed as `log_softmax(lm_head(ln_f(hidden_states[-1])))`. But HuggingFace's
 `hidden_states[-1]` is *already* `ln_f(...)` of the last block's output, so `ln_f` was
 applied **twice**. Every graft target was a distribution the teacher never produces. The
 same double-norm corrupted `_fit_ln_f`'s targets in the `l2` arm.
@@ -214,10 +234,10 @@ is merely not worth its 3× cost. The `l2` arm barely moved (its ln_f targets im
 initial PPL 1,444 → 1,111, with no effect on final PPL), so §4's compute-matched conclusion
 is unaffected.
 
-The lesson we drew from the old number — "optimizing the true KD loss locally is not
-optimizing it globally" — was a plausible story fitted to a bug. We had a mechanism for it
-(the graft hands each block the teacher's discarded complement, information the deployed
-student never has). The mechanism may even be true. It was not what those numbers showed.
+The lesson we drew from the old number, that "optimizing the true KD loss locally is not
+optimizing it globally", was a plausible story fitted to a bug. We had a mechanism for it:
+the graft hands each block the teacher's discarded complement, information the deployed
+student never has. The mechanism may even be true. It was not what those numbers showed.
 
 ### 4b. Stream anchoring also only buys compute
 
@@ -263,23 +283,21 @@ Line the three fit qualities up at 1500 steps:
 | exactly (closed-form ridge) | 190.13 ± 2.11 |
 
 Final quality is **non-monotone** in fit quality, and the exact solution is worse than no
-fit at all. The 300 Adam steps were never "the fit" — they were an *early-stopping
+fit at all. The 300 Adam steps were never "the fit". They were an *early-stopping
 regularizer*, and the regularization, not the fitting, was doing the work. (An explicit
 L2 trust region around the absorbed weights does not reproduce it: §4's `prox` sweep
 found final PPL monotone *decreasing* in fit freedom within the Adam budget.)
 
 This is the sharpest statement of the theme. Better approximation of the teacher's
-function at initialization, by any measure we tried — initial PPL, per-block drift,
-exactness of the layerwise solve — produces a worse distilled student.
-
----
+function at initialization, by any measure we tried (initial PPL, per-block drift,
+exactness of the layerwise solve), produces a worse distilled student.
 
 ### 4d. What absorbed init actually carries
 
 If absorbed init's advantage is not function fidelity (§1), what is it? Each arm below
 destroys one property of the *block weight matrices* and keeps the rest. All arms keep
 the absorbed embeddings (16.6M of the student's 30.0M parameters), so the contrast
-against `random` — which randomizes those too — bounds the embeddings' own contribution.
+against `random`, which randomizes those too, bounds the embeddings' own contribution.
 n=3, 1999 steps, lr=1e-3 (`runs/why_absorbed_s012.json`, `scripts/analysis/why_absorbed.py`):
 
 | arm | what survives in the block weights | init PPL | final PPL |
@@ -297,9 +315,8 @@ sd ≈ 1–6). **Preserving the teacher's spectrum buys nothing over preserving 
 per matrix.** Every low-rank/SVD-flavored justification for absorbed init that appeals
 to singular-value structure is, at this compression ratio, appealing to the wrong thing.
 
-The entire 298.9 → 161.0 gap is the *alignment* of weights to coordinates — the
-teacher's function. And the 438.9 → 298.9 gap is the absorbed embeddings plus correct
-per-matrix scale.
+The entire 298.9 → 161.0 gap is the *alignment* of weights to coordinates: the teacher's
+function. The 438.9 → 298.9 gap is the absorbed embeddings plus correct per-matrix scale.
 
 That resolves the §1 paradox. Absorbed init preserves the teacher's computational graph
 up to a truncation of the residual stream. Initial PPL cannot see this: one badly-scaled
@@ -307,34 +324,31 @@ output direction destroys perplexity while leaving intact the internal circuitry
 distillation goes on to refine. Initial loss is the wrong instrument, which is why
 optimizing it (§4) makes things worse.
 
----
-
 ## 5. What we did *not* establish
 
-- **We did not beat MiniLLM, GKD, or DistiLLM** — and the arms that appeared to were
-  worse than useless. `scripts/analysis/bench.py`'s `skew_kl` (403.33 ± 5.09) computed
-  `KL(p_t ‖ 0.9·p_t + 0.1·p_s)`, but DistiLLM defines `SKL_a(p‖q) = KL(p ‖ a·p + (1−a)·q)`
-  with `a = 0.1`, i.e. a mixture dominated by the **student**. Our version was bounded
-  above by log(1/0.9) = 0.105 and carried **1.6%** of forward-KL's gradient signal at a
-  typical teacher/student gap: that arm measured a loss which was barely training the
-  model. `reverse_kl` (314.95 ± 4.98) is a real divergence but not MiniLLM, which samples
-  on-policy. Both are now fixed and reimplemented in `scripts/analysis/objectives.py` (pinned by
-  `tests/test_objectives.py`), and §12 reports the corrected comparison. **The 403.33 and
-  314.95 numbers above are void.**
-- **We did not test beyond GPT-2 / WikiText-2 / 4.15×.** Findings 2 and 4 are
-  specific to a LayerNorm model with tied embeddings at one compression ratio.
-- **The `identity` result is not a recommendation to truncate arbitrarily.** It is
-  evidence that the basis-selection literature's proxies (variance, Fisher, logit
-  sensitivity) do not predict post-distillation quality for this architecture. A
-  `random_sel` control (arbitrary permuted subset) distinguishes "any unbiased
-  subset works" from "the first k coordinates are special"; see `runs/`.
+**We did not beat MiniLLM, GKD, or DistiLLM**, and the arms that appeared to were worse
+than useless. `scripts/analysis/bench.py`'s `skew_kl` (403.33 ± 5.09) computed
+`KL(p_t ‖ 0.9·p_t + 0.1·p_s)`, but DistiLLM defines `SKL_a(p‖q) = KL(p ‖ a·p + (1−a)·q)`
+with `a = 0.1`, i.e. a mixture dominated by the **student**. Our version was bounded
+above by log(1/0.9) = 0.105 and carried **1.6%** of forward-KL's gradient signal at a
+typical teacher/student gap: that arm measured a loss which was barely training the
+model. `reverse_kl` (314.95 ± 4.98) is a real divergence but not MiniLLM, which samples
+on-policy. Both are now fixed and reimplemented in `scripts/analysis/objectives.py` (pinned by
+`tests/test_objectives.py`), and §12 reports the corrected comparison. **The 403.33 and
+314.95 numbers above are void.**
 
----
+We did not test beyond GPT-2 / WikiText-2 / 4.15×. Findings 2 and 4 are specific to a
+LayerNorm model with tied embeddings at one compression ratio.
+
+And the `identity` result is not a recommendation to truncate arbitrarily. It is evidence
+that the basis-selection literature's proxies (variance, Fisher, logit sensitivity) do not
+predict post-distillation quality for this architecture. A `random_sel` control (arbitrary
+permuted subset) distinguishes "any unbiased subset works" from "the first k coordinates
+are special"; see `runs/`.
 
 ## 6. Honest status of the novelty claim
 
-Every mechanism this work proposed was either anticipated in the literature or
-measured to be harmful:
+Mechanism by mechanism:
 
 | mechanism | status |
 |---|---|
@@ -351,22 +365,22 @@ this document should not be read as claiming one.
 What this pass does contribute:
 
 1. **Two bugs, and both fixes are worth real PPL.** The residual basis was never the
-   profiled subspace (§0) — on the RMSNorm models this library targets, using the profiled
+   profiled subspace (§0). On the RMSNorm models this library targets, using the profiled
    subspace properly (γ-fold + PCA + RMS gain) is worth **16%** (§10). And the student's
    attention heads were shattered by a rounding rule that contradicted its own docstring
-   (§9) — fixing it is worth **7.2% PPL at matched parameters and ~11% less wall-clock**.
-2. A **harness** that matches compute rather than steps and tunes the LR per arm — either
-   correction alone reverses at least one published ranking in `docs/cpsd.md` (§3, §4).
+   (§9); fixing it is worth **7.2% PPL at matched parameters and ~11% less wall-clock**.
+2. A **benchmark rig** that matches compute rather than steps and tunes the LR per arm.
+   Either correction alone reverses at least one published ranking in `docs/cpsd.md`
+   (§3, §4).
 3. Seven **reproducible negative results** (§2, §4, §4b, §4c, §9a, §9b, §10b), one
    **retraction of our own** (§4a, killed by a double-normalization bug we found and
    fixed), and one **positive mechanistic finding** (§4d: absorbed init carries weight
-   alignment, not spectrum) — now confirmed across two architectures by §10a.
+   alignment, not spectrum), now confirmed across two architectures by §10a.
 
-   Six different criteria have been tried against plain reconstruction-optimal projection,
-   across two architectures (table in §10b). **Not one beats it.** The prescription that
-   survives every experiment in this document is: restrict the teacher's operator onto its
-   maximum-variance subspace, keep whole circuits (heads, layers), and change nothing
-   else.
+Six different criteria have been tried against plain reconstruction-optimal projection,
+across two architectures (table in §10b). **Not one beats it.** The prescription that
+survives every experiment in this document is: restrict the teacher's operator onto its
+maximum-variance subspace, keep whole circuits (heads, layers), and change nothing else.
 
 Two claims survive §10's architecture check:
 
@@ -375,7 +389,7 @@ Two claims survive §10's architecture check:
 > And on Llama, a 22× better initialization costs 61% of final quality at equal
 > wall-clock (§10a). This is architecture-general.
 
-The reason (§4d, §10a): changing the residual **basis** *restricts* the teacher's operator —
+The reason (§4d, §10a): changing the residual **basis** *restricts* the teacher's operator.
 `V_out^T W V_in` is still the teacher's weight seen through a subspace, so its layers
 compose as before, and a better subspace is straightforwardly better. **Refitting** replaces
 the operator with a regression solution that merely reproduces the teacher's activations on
@@ -386,23 +400,23 @@ And, weakened but intact:
 > **Ranking what to keep by importance never beats an arbitrary subset.** On GPT-2 it is
 > measurably *worse* (residual coordinates, §2; attention heads, §9a; and selecting heads
 > for coverage instead is worse still, §9b). On Llama it is exactly *tied* (§10). It is
-> never better. What produces a real gain there is a **rotation** — something no ranking of
+> never better. What produces a real gain there is a **rotation**, which no ranking of
 > coordinates can express.
 
 The GPT-2 claim that initial loss is an *inverted* proxy **across bases** does not
-generalize: on an RMSNorm, untied-embedding model it is an ordinary well-behaved proxy
+generalize. On the Llama testbed it is an ordinary well-behaved proxy
 (§10). That much belonged to LayerNorm and tied embeddings. But across *refits* the
-inversion holds on both architectures (§10a) — so "init fidelity is inverted" was two
+inversion holds on both architectures (§10a). So "init fidelity is inverted" was two
 different claims wearing one name, and only one of them was an artifact.
 
-The structural account — whole teacher submatrices in teacher coordinates (§4d), whole
-circuits: heads (§9), layers (§9) — predicted the `d=576` anomaly before that rung was run,
-located the head-geometry bug (§9), and now has cross-architecture support (§10a). It is
-the one idea here that has paid rent more than once.
+The structural account is that the student inherits whole teacher submatrices in teacher
+coordinates (§4d) and whole circuits: heads (§9), layers (§9). That account predicted the
+`d=576` anomaly before that rung was run, located the head-geometry bug (§9), and now has
+cross-architecture support (§10a). It is the one idea here that has paid rent more than once.
 
 But it also predicted that keeping the *important* heads would help, and that was wrong
-(§9a). The obvious repair — importance measures teacher-side redundancy, so select for
-coverage instead — is measurable without training, matches the redundancy data exactly,
+(§9a). The obvious repair, importance measures teacher-side redundancy so select for
+coverage instead, is measurable without training, matches the redundancy data exactly,
 and is *also* wrong (§9b).
 
 So: a principle that says "restrict the teacher's operator, do not re-derive it, and do not
@@ -410,8 +424,6 @@ rank its parts", with one architecture-general confirmation (§10a), one predict
 located a real bug (§9), two refuted corollaries (§9a, §9b), one prediction of ours that a
 scope check refuted (§10), and one of our own published results retracted after we found
 the bug under it (§4a). No technique built on any of it beats prior distillation methods.
-
----
 
 ## 7. Reproducing
 
@@ -453,8 +465,8 @@ tables survive without the artifacts.
 
 Every arm above is far from convergence (155–440 PPL against a teacher at 50.9). An
 initialization that merely lets the optimizer descend faster is indistinguishable, at a
-fixed short budget, from one that reaches a better optimum — and only the second
-justifies "method A beats method B".
+fixed short budget, from one that reaches a better optimum. Only the second justifies
+"method A beats method B".
 
 `scripts/analysis/budget_scaling.py` traces PPL against step count at constant LR (so an eval at
 step *n* means the same thing in every run). Both arms, seed 0, same schedule and data
@@ -471,14 +483,12 @@ has not reached what absorbed init achieves by step 500 (313.4 — nearly). The 
 gap narrows (436 → 169 PPL) but the multiplicative gap is flat.
 
 So absorbed init is not merely a faster descent: it is a genuinely better basin at every
-budget we can afford. That is the one claim in this repo that survives scrutiny intact —
-and it is prior art (FWSVD 2207.00112, Weight Subcloning 2312.09299, Minitron 2407.14679),
-not a contribution of this codebase.
+budget we can afford. That is the one claim in this repo that survives scrutiny intact.
+It is also prior art (FWSVD 2207.00112, Weight Subcloning 2312.09299, Minitron
+2407.14679), not a contribution of this codebase.
 
 Note it holds for the *identity-truncation* basis, which no prior work proposes, and not
 for the profiled subspace the repo believes it is using.
-
----
 
 ## 9. The compression axis, and a broken attention geometry
 
@@ -497,7 +507,7 @@ lr=1e-3, `runs/axis_s012.json`):
 
 Two things. First, the random-init column is **flat** (487–495): these architectures are
 interchangeable on their own. Everything separating the rungs is how well absorption
-transfers into them. Second, neither extreme wins — "width-first" (the doctrine
+transfers into them. Second, neither extreme wins. "Width-first" (the doctrine
 `fasd/compression/width_pruner.py` encodes, citing Minitron 2407.14679) and depth-first
 are both wrong here; the optimum is interior. The deeper, narrower rungs also consume
 *more* FLOPs per step (`L·d²` runs 1.77M → 2.88M), so they are not compute-starved
@@ -507,7 +517,7 @@ relative to `d=768, L=3`.
 The reason is not the width/depth trade-off. GPT-2 lays its attention heads out
 contiguously along the residual axis with head_dim = 64. Identity truncation keeps the
 first `k` coordinates, so when `k` is a multiple of 64 the student's heads *are* the
-teacher's first `k/64` heads — q, k, v, o transferred whole, attention circuits intact.
+teacher's first `k/64` heads: q, k, v, o transferred whole, attention circuits intact.
 When it is not, every head is a fragment of one teacher head glued to a fragment of the
 next.
 
@@ -518,12 +528,12 @@ next.
 | d=512 (8 heads) | 64 | yes |
 | **d=576 (12 heads)** | **48** | **no — 5 PPL worse** |
 
-This is §4d one level down: alignment is not a property of weight matrices in isolation
-but of the *circuits* they compose into.
+This is §4d one level down. Alignment lives in the *circuits* the weight matrices compose
+into, not in the matrices taken in isolation.
 
 `scripts/analysis/heads.py` tests it directly at the repo's own operating point. The repo builds
 students with `n_head` pinned to the teacher's 12, so `n_embd=324` gives **head_dim=27**
-and shatters all twelve heads — even though `width_pruner.py`'s docstring states "Retain
+and shatters all twelve heads, even though `width_pruner.py`'s docstring states "Retain
 attention heads". n=3, 2000 steps, lr=1e-3, `runs/heads_s012.json`:
 
 | n_embd | n_head | head_dim | params | final PPL |
@@ -547,13 +557,13 @@ interior optimum, because `n_embd` and the FFN width trade against each other:
 
 ### 9a. But *which* heads? Importance ranking loses again
 
-Head geometry fixed, the choice of which `k/64` heads each layer inherits is free — the
+Head geometry fixed, the choice of which `k/64` heads each layer inherits is free. The
 attention space and the residual stream only shared a basis by accident (`absorb_gpt2`
 now takes `head_bases`). Head importance is famously non-uniform, and measured by the KL
 that ablating a head costs the teacher, it spans **296× within layer 0 alone** (337.3 to
 1.14). Surely keeping the important ones helps.
 
-It does not. All arms at `n_embd=320`, 5 heads, 30,006,128 parameters — the *only*
+It does not. All arms sit at `n_embd=320`, 5 heads, 30,006,128 parameters; the *only*
 difference is which five of the twelve teacher heads each layer inherits (n=3, 2000 steps,
 `runs/head_select_s012.json`; `mode="first"` is bit-identical to the previous behavior):
 
@@ -579,14 +589,14 @@ different structural units:
 Three different objects, three different importance measures, three inversions. Whatever
 distillation extracts from an initialization, it is not "the parts the teacher would miss
 most". A plausible reading: ablation importance scores what the *teacher* cannot lose,
-which is a statement about redundancy — the top-5 heads may duplicate each other's
-function — whereas a student that will be retrained anyway is better served by *coverage*.
+which is a statement about redundancy (the top-5 heads may duplicate each other's
+function), whereas a student that will be retrained anyway is better served by *coverage*.
 We did not test that reading.
 
 ### 9b. The redundancy explanation, pre-registered and falsified
 
 §9a offered a reading: ablation importance scores what the *teacher* cannot lose, which is
-a statement about redundancy — delete either of two heads that duplicate each other and
+a statement about redundancy. Delete either of two heads that duplicate each other and
 little is lost, so both look unimportant, while a pair that jointly carries something
 unique both look important. A student that gets retrained anyway might be better served by
 *coverage* of the teacher's head functions than by individually-important heads.
@@ -622,11 +632,11 @@ relation is not monotone, and the redundancy explanation is refuted.
 
 What the five arms do say, descriptively: `first` and `diverse` are tied and best,
 `random` is a hair behind, and the two rules that select *systematically for a property*
-— highest ablation KL, and facility-location centrality — are both ~5–6 PPL worse. No
-selection rule beats an arbitrary choice.
+(highest ablation KL, facility-location centrality) are both ~5–6 PPL worse. No selection
+rule beats an arbitrary choice.
 
-The practical consequence is that there is no gain available here. `head_bases` stays in
-the API, defaulted to the arbitrary choice, so all of this stays reproducible.
+There is no gain available here, then. `head_bases` stays in the API, defaulted to the
+arbitrary choice, so all of this stays reproducible.
 
 We do not have an explanation for §9a. The obvious one is measured and wrong.
 
@@ -640,16 +650,14 @@ not up, so a requested rank of 325 gives 320 rather than inflating to 384.
 
 On GPT-2 this changes the default student at `arch_multiplier=0.5` from
 `n_embd=336, n_head=12, head_dim=28` to `n_embd=320, n_head=5, head_dim=64`, and at
-`arch_multiplier=1.0` from `660/12/55` to `640/10/64` — the latter being exactly the
-best rung of the §9 axis table, found independently.
+`arch_multiplier=1.0` from `660/12/55` to `640/10/64`. The latter is exactly the best rung
+of the §9 axis table, found independently.
 
 **This is the one change in this pass that makes the method measurably better:
 7.2% lower PPL at matched parameters and ~11% less wall-clock.** It is not a novel
-technique — retaining whole attention heads is standard practice (Michel et al. 2019,
+technique. Retaining whole attention heads is standard practice (Michel et al. 2019,
 Minitron 2407.14679), and `width_pruner.py` already claimed to do it. It is a bug fix
 that the alignment finding predicted and then located.
-
----
 
 ## 10. The inversion is a GPT-2 artifact (and §2's mechanism is confirmed)
 
@@ -658,8 +666,8 @@ Everything above runs on GPT-2. §2 blamed the inversion on two GPT-2 properties
 the mean-removal fold that would make a rotation legitimate). That is a falsifiable claim,
 so we falsified it.
 
-`JackFram/llama-160m` has GPT-2's exact shape — hidden 768, 12 layers, 12 heads,
-head_dim 64 — with **RMSNorm** (no centering) and **untied embeddings**. `fasd/compression/
+`JackFram/llama-160m` has GPT-2's exact shape (hidden 768, 12 layers, 12 heads,
+head_dim 64) with **RMSNorm** (no centering) and **untied embeddings**. `fasd/compression/
 llama_absorb.py` gives it the same treatment: a function-preserving γ-fold (verified to
 preserve logits, and to reproduce the teacher bit-for-bit at full width), a whole-head
 student, an RMS-gain correction applied identically to every arm, and only the residual
@@ -682,46 +690,47 @@ Compare GPT-2 at 4.15×:
 | PCA rotation | 0.987 | >10¹⁶ | **diverges** |
 
 The two tables are opposites. On Llama the ordering is **perfectly conventional**: final
-PPL tracks retained variance monotonically, init PPL tracks final PPL, and the PCA rotation
-— which diverges on GPT-2 — is the *best* basis, by 16% over identity truncation. On GPT-2
-every one of those relations is inverted or broken.
+PPL tracks retained variance monotonically, init PPL tracks final PPL, and the PCA
+rotation, which diverges on GPT-2, is the *best* basis, by 16% over identity truncation.
+On GPT-2 every one of those relations is inverted or broken.
 
 So §2's mechanism holds and **§2's finding does not generalize.** The inversion belongs to
 LayerNorm + tied embeddings, not to distillation.
 
-Two refinements worth keeping:
+Two refinements are worth keeping.
 
-- **Outlier dominance is not the cause.** Llama-160m's residual stream is *also*
-  outlier-dominated — its top coordinate carries **61.7%** of the variance (GPT-2: 73.7%),
-  max/median 3,520× (GPT-2: 9,136×). Same pathology, opposite outcome. What differs is that
-  RMSNorm never centers across those coordinates, and an untied `lm_head` lets the γ-fold
-  absorb the final norm's gain, so a rotated stream is representable.
-- **Importance ranking still buys nothing.** On Llama, `select` (0.939 variance retained,
-  90.82) is statistically **tied** with an arbitrary subset (`random_sel`, 0.905 retained,
-  90.77). It merely stops *hurting*. The entire Llama gain comes from the rotation, which
-  no ranking of coordinates can produce. That much does survive both architectures: on
-  GPT-2 importance-ranked selection is worse than arbitrary, on Llama it is equal, and
-  nowhere is it better.
+Outlier dominance is not the cause. Llama-160m's residual stream is *also*
+outlier-dominated: its top coordinate carries **61.7%** of the variance (GPT-2: 73.7%),
+max/median 3,520× (GPT-2: 9,136×). Same pathology, opposite outcome. What differs is that
+RMSNorm never centers across those coordinates, and an untied `lm_head` lets the γ-fold
+absorb the final norm's gain, so a rotated stream is representable.
+
+Importance ranking still buys nothing. On Llama, `select` (0.939 variance retained, 90.82)
+is statistically **tied** with an arbitrary subset (`random_sel`, 0.905 retained, 90.77).
+It merely stops *hurting*. The entire Llama gain comes from the rotation, which no ranking
+of coordinates can produce. That much does survive both architectures: on GPT-2
+importance-ranked selection is worse than arbitrary, on Llama it is equal, and nowhere is
+it better.
 
 ### Practical consequence
 
-For RMSNorm, untied-embedding models — Llama, Mistral, Qwen, i.e. everything the repo
-actually targets — the right absorbed init is **γ-fold + PCA rotation + RMS-gain
-correction**, and it is worth **16%** over the identity truncation the `_residual_basis`
+For RMSNorm, untied-embedding models (Llama, Mistral, Qwen, i.e. everything the repo
+actually targets) the right absorbed init is **γ-fold + PCA rotation + RMS-gain
+correction**. It is worth **16%** over the identity truncation the `_residual_basis`
 bug (§0) silently shipped. That is a larger gain than the head-geometry fix (§9), and it
-means the repo's *original intent* — use the profiled subspace — was right for its target
+means the repo's *original intent* (use the profiled subspace) was right for its target
 architectures and wrong only for the GPT-2 testbed it was measured on.
 
 `scripts/analysis/llama_basis.py` reproduces the table. `tests/test_llama_absorb.py` pins the fold
 and the full-width exactness.
 
-### 10a. But the *fit* inversion is not an artifact — and that separates two phenomena
+### 10a. But the *fit* inversion is not an artifact, and that separates two phenomena
 
 §10 makes a prediction about §4. If the inversion is a LayerNorm artifact, then the
 drift-corrected fit that *fails* on GPT-2 should *succeed* on Llama, where initial loss is
 an honest proxy again. `gap_fit_llama` re-solves each block's two residual writers
 (`o_proj`, `down_proj`) in forward order against the gap between the student's own drifted
-stream and the teacher's projected one — a ridge regression per sublayer, costing 2.7s
+stream and the teacher's projected one: a ridge regression per sublayer, costing 2.7s
 against the 23s that sank the GPT-2 version. Per-block drift after fitting: 0.09–0.17, flat
 with depth. Pre-registered; the control gets +43 steps to repay the 2.7s
 (`runs/llama_gapfit_s012.json`, n=3):
@@ -732,7 +741,7 @@ with depth. Pre-registered; the control gets +43 steps to repay the 2.7s
 | + sequential closed-form gap fit | 2000 | **895** | 129.84 ± 1.54 | 119 |
 
 **Wrong again.** A 22× better initialization, at equal wall-clock, gives a 61% worse
-distilled model — on the very architecture where the *basis* ordering is conventional.
+distilled model, on the very architecture where the *basis* ordering is conventional.
 
 So there are **two different phenomena**, and §10 separated them:
 
@@ -745,28 +754,28 @@ The basis inversion is a LayerNorm + tied-embedding artifact. The fit inversion 
 architecture-general.
 
 §4d already explained why, and this is its cross-architecture confirmation. **A change of
-basis restricts the teacher's operator** — `W_s = V_out^T W V_in` is the teacher's weight
+basis restricts the teacher's operator**: `W_s = V_out^T W V_in` is the teacher's weight
 seen through a subspace, so the teacher's layers still compose the way they did, and a
 better subspace is straightforwardly better. **A refit replaces the operator** with a
 regression solution that happens to reproduce the teacher's activations on a calibration
-set. The first preserves alignment; the second buys function accuracy by destroying it.
-Distillation exploits the alignment.
+set. The first preserves alignment. The second buys function accuracy by destroying it,
+and alignment is what distillation exploits.
 
-That is why permuting a block matrix — preserving every singular value and every entry,
-breaking only alignment — costs 161 → 301 PPL (§4d), and why the exact closed-form solve is
+That is why permuting a block matrix (preserving every singular value and every entry,
+breaking only alignment) costs 161 → 301 PPL (§4d), and why the exact closed-form solve is
 the worst arm on GPT-2 (§4c) *and* on Llama.
 
 ### 10b. And the *logit-optimal* basis does not beat plain PCA either
 
 §10 shows that on Llama the basis matters and PCA wins. PCA minimizes error in the residual
 stream, `E‖(I−P)h‖²`. But a compressed student pays for error *through the unembedding*:
-`E‖W_lm(I−P)h‖²`. Those are different objectives, and the second is not an eigenproblem —
+`E‖W_lm(I−P)h‖²`. Those are different objectives, and the second is not an eigenproblem.
 `f(P) = tr(M(I−P)S(I−P))` with `M = W_lm^T W_lm` is quadratic in `P`, so its minimizer is a
 genuine Grassmann-manifold problem. `grassmann_logit_basis` solves it directly (Adam on `V`
 with a QR retraction, started from PCA, so it can only improve on the objective).
 
 It works, as an optimizer. Started from PCA it cuts relative logit error by **32%** while
-retaining slightly *less* variance — the two criteria genuinely disagree, which makes this a
+retaining slightly *less* variance. The two criteria genuinely disagree, which makes this a
 clean test of which one distillation cares about (n=3, `runs/llama_grassmann_s012.json`):
 
 | basis | var kept | rel. logit error | init PPL | final PPL |
@@ -779,10 +788,10 @@ error has 3.4× worse initial perplexity**. The surrogate fails to predict even 
 it is a surrogate for.
 
 The reason is that `M = W_lm^T W_lm` is the Jacobian of the *final* layer alone, while the
-residual basis is shared by all twelve — a direction that barely reaches the logits
-directly may be exactly what layer 3 needs to compute what layer 9 writes. Linearizing the
-network at its output throws that away. Variance is agnostic about which layer uses what,
-and that agnosticism is apparently the right prior.
+residual basis is shared by all twelve. A direction that barely reaches the logits directly
+may be exactly what layer 3 needs to compute what layer 9 writes. Linearizing the network
+at its output throws that away. Variance is agnostic about which layer uses what, and that
+agnosticism is apparently the right prior.
 
 **This closes the loop on the whole document.** Six criteria have now been tried against
 plain reconstruction-optimal projection, across two architectures:
@@ -802,16 +811,14 @@ circuits, and change nothing else.**
 
 ### What this does *not* license
 
-Tested on Llama: §2's basis inversion (**refuted** — a LayerNorm artifact), §1's init-PPL
+Tested on Llama: §2's basis inversion (**refuted**, a LayerNorm artifact), §1's init-PPL
 correlation across bases (**refuted**, same cause), and §4/§4c's fit inversion
-(**confirmed** — it generalizes).
+(**confirmed**, it generalizes).
 
-Not tested outside GPT-2: the spectrum-vs-alignment ablation (§4d) — though §10a is strong
-indirect support — and the head-selection results (§9a, §9b). Of the things we did check,
+Not tested outside GPT-2: the spectrum-vs-alignment ablation (§4d), though §10a is strong
+indirect support, and the head-selection results (§9a, §9b). Of the things we did check,
 one flipped (§2's basis inversion) and one held (§4's fit inversion). Do not assume the rest
 transfer.
-
----
 
 ## 11. Remaining open questions
 
@@ -820,15 +827,13 @@ transfer.
    300 Adam steps impose, and can it be written down? A method that names it would be a
    real contribution; we did not find it.
 2. **Does finding 2 (importance ranking hurts) hold on an RMSNorm model with untied
-   embeddings?** The mechanism — LayerNorm normalizing across a stream of outlier
-   coordinates — predicts the effect should weaken on Llama-family models.
+   embeddings?** The mechanism (LayerNorm normalizing across a stream of outlier
+   coordinates) predicts the effect should weaken on Llama-family models.
 3. **Does any of this transfer past GPT-2 / WikiText-2 / 4.15×?** Nothing here has been
    tested at another scale, ratio, or architecture.
 4. **Does the ordering hold at convergence?** §8 only rules out a 4×-budget artifact.
 
----
-
-## 12. The objective axis — and a second bug of ours
+## 12. The objective axis, and a second bug of ours
 
 §6 concludes that no initialization criterion beats plain reconstruction, so if a technique
 exists that conclusively beats prior distillation work, it must live in the **objective** or
@@ -842,7 +847,7 @@ gap as far as we honestly can.
 
     SKL_a(p ‖ q) = KL( p ‖ a·p + (1−a)·q ),   a = 0.1
 
-— a mixture dominated by the **student**, not the teacher. Ours was bounded above by
+That mixture is dominated by the **student**, not the teacher. Ours was bounded above by
 log(1/0.9) = 0.105 and carried **1.6%** of forward-KL's gradient signal at a typical
 teacher/student gap. That arm was barely training the model. It is fixed in
 `scripts/analysis/h2h.py` and reimplemented in `scripts/analysis/objectives.py`, pinned by
@@ -876,7 +881,7 @@ is a question about compute, not about the objective, and we cannot settle it he
 
 **Validation perplexity is the exact quantity forward KL optimizes.** Minimizing
 `KL(p_t ‖ p_s)` on teacher-forced data is, up to the teacher's own entropy, minimizing the
-student's next-token cross-entropy on that data — which is what perplexity measures.
+student's next-token cross-entropy on that data, which is what perplexity measures.
 
 MiniLLM and GKD *argue for* reverse KL and on-policy sampling **on the grounds that they
 trade perplexity for generation quality**: reverse KL is mode-seeking, so the student stops
@@ -898,9 +903,9 @@ initialization, which is what this document is about.
 ### 12d. What this is not
 
 These are the *objectives and data policies* those papers contribute, dropped into one
-controlled harness. They are **not** the published systems. MiniLLM's sequence-level policy
+controlled rig. They are **not** the published systems. MiniLLM's sequence-level policy
 gradient, its length normalization and teacher-mixed rollouts are absent; DistiLLM's
 adaptive off-policy schedule is a fixed ratio; neither is tuned. Where a number here
 disagrees with a paper's, believe the paper. We report them because §5's placeholder arms
-were worse than nothing — one of them was literally not training the model — and a wrong
+were worse than nothing (one of them was literally not training the model), and a wrong
 number sitting next to a right one is more damaging than no number at all.

@@ -59,6 +59,10 @@ def main() -> None:
           f"({count_params(teacher) / count_params(student):.2f}x smaller)")
     print(f"final KD loss:      {result.final_kd:>10.4f}")
     print(f"V rotated by:       {result.max_principal_angle:>10.4f} rad from PCA init")
+    # How far the free residual D carried the student out of the restriction class. The
+    # student is a restriction at step 0 (D = 0) but is not *confined* to be one, so this is
+    # a measurement, not a guarantee -- see LRDResult.restriction_gap.
+    print(f"restriction gap:    {result.restriction_gap:>10.4f}  (||D|| / ||V^T W V||)")
     print(f"student logits finite: {bool(torch.isfinite(logits).all())}")
 
 
