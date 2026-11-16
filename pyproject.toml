@@ -8,9 +8,10 @@ version = "0.4.0"
 description = "Learned Restriction Distillation (LRD) and activation-subspace compression for LLMs"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "neural_distill contributors" }]
+authors = [{ name = "substill contributors" }]
 license = { text = "MIT" }
-keywords = ["pytorch", "distillation", "compression", "subspace", "stiefel", "llm"]
+keywords = ["pytorch", "distillation", "compression", "subspace", "stiefel", "llm",
+            "knowledge-distillation", "model-compression", "llama"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -26,6 +27,12 @@ dependencies = [
     "omegaconf>=2.3",
     "tqdm",
 ]
+
+[project.urls]
+Homepage = "https://github.com/stephenoffer/substill"
+Documentation = "https://stephenoffer.github.io/substill/"
+Repository = "https://github.com/stephenoffer/substill"
+Issues = "https://github.com/stephenoffer/substill/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-timeout", "ruff>=0.6"]

@@ -12,6 +12,14 @@ on:
       - "README.md"
       - "pyproject.toml"
       - ".github/workflows/docs.yml"
+  # Build (but don't publish) on PRs so a broken docs build is caught before merge.
+  pull_request:
+    paths:
+      - "docs/**"
+      - "substill/**"
+      - "README.md"
+      - "pyproject.toml"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
@@ -20,8 +28,9 @@ permissions:
   id-token: write
 
 # Allow one concurrent deployment; don't cancel an in-progress publish.
+# PR builds use their own group so they never queue behind (or displace) a deploy.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}
   cancel-in-progress: false
 
 jobs:
@@ -45,12 +54,15 @@ jobs:
         run: python -m sphinx -b html --keep-going docs docs/_build/html
 
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: docs/_build/html
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
